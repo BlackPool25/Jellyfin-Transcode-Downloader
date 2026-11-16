@@ -9,6 +9,14 @@
     "imageUrl": "https://raw.githubusercontent.com/ph15ch/Jellyfin-Transcode-Downloader/main/logo.png",
     "versions": [
       {
+        "version": "1.2.0.0",
+        "changelog": "Multi-track downloads + series folders: audio/subtitle checklists (sidecar .srt, extra-audio downloads, burn-in single enforced), MP4/MKV container choice, recommended quality rung, series/season batch entries downloading into Series/Season folders, Download endpoint filename+container support",
+        "targetAbi": "12.4.0.0",
+        "sourceUrl": "https://github.com/BlackPool25/Jellyfin-Transcode-Downloader/releases/download/v1.2.0/jellyfin-transcode-downloader_1.2.0.zip",
+        "checksum": "8949dff7f202a71e3ff2e31a5531b199",
+        "timestamp": "2026-11-16T02:34:11Z"
+      },
+      {
         "version": "1.1.0.0",
         "changelog": "Jellyfin 12.4 port + phone-first downloads: net10.0/12.4.0 SDK, ApiKey+Authorization auth fix, MaxWidth/MaxHeight tiers, phone bitrate ladder, stream-to-disk downloads, queue persistence with retry, audio/subtitle/track pickers with burn-in default, season batch queue, Download endpoint with real filenames, Apple codec guard",
         "targetAbi": "12.4.0.0",
