@@ -2664,33 +2664,41 @@
             subtitleMethod: tracks ? tracks.subtitleMethod : null,
         };
         getApiClient(0, 5, async (client) => {
-            const token = client.accessToken();
-            const baseUrl = client.serverAddress() || window.location.origin;
-            spec.baseUrl = baseUrl;
-            // Mobile browsers without a save picker can't take blobs or directories:
-            // hand the transcode URL to the browser itself (OS download manager).
-            if (!savedDirHandle && isMobileBrowser() && typeof window.showSaveFilePicker !== 'function') {
-                const parts = buildDownloadParts(spec);
-                const url = `${baseUrl}/TranscodeDownloader/Download/${spec.itemId}`
-                    + `?${parts.query}&filename=${encodeURIComponent(parts.filename)}`
-                    + `&container=${parts.container}&ApiKey=${encodeURIComponent(token)}`;
-                navigateToDownload(url, parts.filename);
+            try {
+                const token = client.accessToken();
+                const baseUrl = client.serverAddress() || window.location.origin;
+                spec.baseUrl = baseUrl;
+                // Mobile browsers without a save picker can't take blobs or directories:
+                // hand the transcode URL to the browser itself (OS download manager).
+                if (!savedDirHandle && isMobileBrowser() && typeof window.showSaveFilePicker !== 'function') {
+                    const parts = buildDownloadParts(spec);
+                    const url = `${baseUrl}/TranscodeDownloader/Download/${spec.itemId}`
+                        + `?${parts.query}&filename=${encodeURIComponent(parts.filename)}`
+                        + `&container=${parts.container}&ApiKey=${encodeURIComponent(token)}`;
+                    navigateToDownload(url, parts.filename);
+                    queueExtraTracks(token, spec, extras);
+                    return;
+                }
+                // Saved folder wins: everything lands there with no picker.
+                // Otherwise fall back to the one-time save dialog.
+                let fileHandle = null;
+                let dirHandle = null;
+                if (savedDirHandle && await ensureDirPermission(savedDirHandle)) {
+                    dirHandle = savedDirHandle;
+                } else {
+                    const suggestedName = buildDownloadParts(spec).filename;
+                    fileHandle = await pickSaveFile(suggestedName, spec.container);
+                    if (fileHandle === 'cancelled') return;
+                }
+                addToQueue(token, spec, fileHandle, dirHandle);
                 queueExtraTracks(token, spec, extras);
-                return;
+            } catch (err) {
+                console.error('[TranscodeDownloader] Download setup failed:', err);
+                showTransientNotice(t('DownloadFailed'));
             }
-            // Saved folder wins: everything lands there with no picker.
-            // Otherwise fall back to the one-time save dialog.
-            let fileHandle = null;
-            let dirHandle = null;
-            if (savedDirHandle && await ensureDirPermission(savedDirHandle)) {
-                dirHandle = savedDirHandle;
-            } else {
-                const suggestedName = buildDownloadParts(spec).filename;
-                fileHandle = await pickSaveFile(suggestedName, spec.container);
-                if (fileHandle === 'cancelled') return;
-            }
-            addToQueue(token, spec, fileHandle, dirHandle);
-            queueExtraTracks(token, spec, extras);
+        }, () => {
+            console.error('[TranscodeDownloader] ApiClient unavailable when starting download.');
+            showTransientNotice(t('DownloadFailed'));
         });
     }
 
