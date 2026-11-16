@@ -86,7 +86,8 @@
     function formatSize(bytes) {
         if (!bytes || bytes <= 0) return 'unknown size';
         if (bytes >= 1_000_000_000) return `~${(bytes / 1_000_000_000).toFixed(1)} GB`;
-        return `~${Math.round(bytes / 1_000_000)} MB`;
+        if (bytes >= 1_000_000) return `~${Math.round(bytes / 1_000_000)} MB`;
+        return `~${Math.max(1, Math.round(bytes / 1000))} KB`;
     }
 
     // Jellyfin 12.x rejects the legacy lowercase ?api_key= query param (and dual
@@ -363,6 +364,8 @@
         }
         try { window.localStorage.removeItem(STORAGE_QUEUE); } catch (_) { /* noop */ }
         renderQueue();
+        // Restored rows would otherwise sit idle forever — nothing else kicks the pump.
+        if (downloadQueue.length > 0 && !queueProcessing) processQueue();
     }
 
     // Tokens expire; a restored entry has none. Refresh inline before its fetch.
@@ -407,15 +410,21 @@
 
     function retryQueueEntry(id) {
         const entry = downloadQueue.find(e => e.id === id);
-        if (!entry || entry.status !== 'failed' || !entry.spec) return;
-        // Fresh session ids: reusing a PlaySessionId can resume a stale server job.
-        const parts = buildDownloadParts(entry.spec);
-        entry.url = parts.url;
-        entry.stopUrl = parts.stopUrl;
-        entry.filename = parts.filename;
-        entry.estimatedBytes = parts.estimatedBytes;
+        if (!entry || entry.status !== 'failed') return;
+        if (entry.kind === 'subtitle') {
+            // Sidecars are plain re-fetches of the same URL — no session to rebuild.
+            entry.error = null;
+        } else {
+            if (!entry.spec) return;
+            // Fresh session ids: reusing a PlaySessionId can resume a stale server job.
+            const parts = buildDownloadParts(entry.spec);
+            entry.url = parts.url;
+            entry.stopUrl = parts.stopUrl;
+            entry.filename = parts.filename;
+            entry.estimatedBytes = parts.estimatedBytes;
+            entry.error = null;
+        }
         entry.receivedBytes = 0;
-        entry.error = null;
         entry.status = 'waiting';
         entry.abortController = null;
         persistWaitingQueue();
@@ -432,6 +441,13 @@
             const httpError = new Error(`HTTP ${response.status}`);
             httpError.status = response.status;
             throw httpError;
+        }
+        // Batch sidecars stream into the same Series/Season folder as their episode;
+        // single-download sidecars are tiny enough for the in-memory path.
+        if (entry.dirHandle) {
+            const writable = await openBatchFile(entry);
+            await saveStreamToDisk(response.body, writable, 0, entry);
+            return;
         }
         const buf = await response.arrayBuffer();
         if (!buf.byteLength) throw new Error('Transcode produced no data');
@@ -1244,7 +1260,6 @@
             selectedAudioLanguage = (defAudio && (defAudio.Language || defAudio.DisplayLanguage)) || null;
             if (subs.length === 0) {
                 selectedSubtitleMode = 'none';
-                selectedSubtitleStreamIndex = null;
                 selectedSubtitleChecked = new Set();
                 selectedSubtitleLanguage = null;
             } else {
@@ -1485,9 +1500,12 @@
                             const baseUrl = client.serverAddress() || window.location.origin;
                             const dirHandle = await pickBatchDirectory();
                             if (!dirHandle) return;
+                            const bStreams = (currentSource && currentSource.MediaStreams) || [];
+                            const bSubs = bStreams.filter(s => s.Type === 'Subtitle');
                             enqueueEpisodeBatch(client, token, baseUrl, dirHandle,
                                 batchOpt.episodes, tier, bitrate, videoCodec, audioCodec,
-                                batchOpt.seriesTitle);
+                                batchOpt.seriesTitle,
+                                extraSubtitleLangs(bSubs, selectedSubtitleLanguage));
                         });
                     } else if (batchSeason) {
                         getApiClient(0, 5, async (client) => {
@@ -1515,11 +1533,15 @@
                             }
                             const dirHandle = await pickBatchDirectory();
                             if (!dirHandle) return;
+                            const sStreams = (currentSource && currentSource.MediaStreams) || [];
+                            const sSubs = sStreams.filter(s => s.Type === 'Subtitle');
                             enqueueEpisodeBatch(client, token, baseUrl, dirHandle, eps,
-                                tier, bitrate, videoCodec, audioCodec, item.SeriesName);
+                                tier, bitrate, videoCodec, audioCodec, item.SeriesName,
+                                extraSubtitleLangs(sSubs, selectedSubtitleLanguage));
                         });
                     } else {
-                        const tracks = resolveEpisodeTracks(item, currentSource);
+                        const tracks = resolveEpisodeTracks(item, currentSource,
+                            selectedAudioChecked, selectedSubtitleChecked, selectedSubtitleMode);
                         const streams = (currentSource && currentSource.MediaStreams) || [];
                         const audios = streams.filter(s => s.Type === 'Audio');
                         const subs = streams.filter(s => s.Type === 'Subtitle');
@@ -1596,7 +1618,19 @@
     // Batch enqueue with proper folders: each episode lands in
     // <chosen dir>/<SeriesName>/Season NN/<file>, mirroring Jellyfin's library layout.
     // One directory picker covers the whole batch; per-episode files stream to disk.
-    async function enqueueEpisodeBatch(client, token, baseUrl, dirHandle, episodes, tier, bitrate, videoCodec, audioCodec, seriesTitle) {
+    // Extra subtitle languages, resolved per sheet against the current source.
+    function extraSubtitleLangs(subs, primaryLang) {
+        const out = [];
+        const prim = (primaryLang || '').toLowerCase();
+        for (const idx of selectedSubtitleChecked) {
+            const s = subs.find(x => x.Index === idx);
+            const lang = (s && (s.Language || s.DisplayLanguage) || '').toLowerCase();
+            if (lang && lang !== prim && !out.includes(lang)) out.push(lang);
+        }
+        return out;
+    }
+
+    async function enqueueEpisodeBatch(client, token, baseUrl, dirHandle, episodes, tier, bitrate, videoCodec, audioCodec, seriesTitle, extraSubLangs) {
         let queued = 0;
         for (const ep of episodes) {
             const sources = ep.MediaSources || [];
@@ -1634,6 +1668,31 @@
                 status: 'waiting',
             });
             queued += 1;
+            // Extra subtitle languages ride along as sidecars in the same folder.
+            // (Extra audios stay single-download-only: one transcode carries one audio,
+            // so multiplying them across a season would explode into N×M full encodes.)
+            for (const lang of extraSubLangs || []) {
+                const sub = (src.MediaStreams || []).find(s =>
+                    s.Type === 'Subtitle' && ((s.Language || s.DisplayLanguage) || '').toLowerCase() === lang);
+                if (!sub) continue;
+                const subBase = parts.filename.replace(/\.(mp4|mkv)$/i, '');
+                enqueue({
+                    id: `${ep.Id}-sub${sub.Index}-${Date.now()}-${queued}`,
+                    kind: 'subtitle',
+                    spec: null,
+                    token,
+                    fileHandle: null,
+                    dirHandle,
+                    dirPath: [ep.SeriesName || seriesTitle || 'Unknown series', `Season ${seasonNo}`],
+                    filename: `${subBase}.${lang}.srt`,
+                    estimatedBytes: 0,
+                    url: `${baseUrl}/Videos/${ep.Id}/${src.Id}/Subtitles/${sub.Index}/Stream.srt`,
+                    stopUrl: null,
+                    receivedBytes: 0,
+                    abortController: null,
+                    status: 'waiting',
+                });
+            }
         }
         showTransientNotice(`Queued ${queued} episode${queued === 1 ? '' : 's'}.`);
     }
@@ -1740,7 +1799,8 @@
             sheet.appendChild(header);
             const sub = document.createElement('div');
             sub.style.cssText = 'font-size:12px;color:#888;margin-bottom:12px;';
-            sub.textContent = item.Name || '';
+            sub.textContent = (item.Name || '')
+                + ' — batch uses your primary audio + subtitle picks; extra tracks stay single-download only.';
             sheet.appendChild(sub);
 
             const checked = new Set(seasons.map(s => s.Id));
@@ -1842,31 +1902,41 @@
 
     // --- Download actions ---
 
-    // Per-episode track resolution shared by single and season-batch downloads:
-    // same audio language as picked, same subtitle mode+language, falling back to
-    // server defaults. Keeps a 12-episode batch consistent without 12 pickers.
-    function resolveEpisodeTracks(epItem, src) {
+    // Per-episode track resolution shared by single and season-batch downloads.
+    // With explicit checklist sets (single sheet), the first checked track wins and an
+    // emptied subtitle list means NO subtitles — explicit user choice beats defaults.
+    // With null sets (batch), resolution falls back to matching the picked languages.
+    function resolveEpisodeTracks(epItem, src, audioChecked, subChecked, mode) {
         const streams = (src && src.MediaStreams) || [];
         const audios = streams.filter(s => s.Type === 'Audio');
         const subs = streams.filter(s => s.Type === 'Subtitle');
+        const subMode = mode || selectedSubtitleMode;
         let audioStreamIndex = null;
         if (audios.length > 0) {
-            const lang = (selectedAudioLanguage || '').toLowerCase();
-            const t = (lang && audios.find(a => (a.Language || '').toLowerCase() === lang))
-                || audios.find(a => a.IsDefault)
-                || audios[0];
+            let t = audioChecked ? primaryChecked(audios, audioChecked) : null;
+            if (!t) {
+                const lang = (selectedAudioLanguage || '').toLowerCase();
+                t = (lang && audios.find(a => (a.Language || '').toLowerCase() === lang))
+                    || audios.find(a => a.IsDefault)
+                    || audios[0];
+            }
             audioStreamIndex = t ? t.Index : null;
         }
         let subtitleStreamIndex = null;
         let subtitleMethod = null;
-        if (selectedSubtitleMode !== 'none' && subs.length > 0) {
-            const lang = (selectedSubtitleLanguage || '').toLowerCase();
-            const t = (lang && subs.find(s => (s.Language || '').toLowerCase() === lang))
-                || subs.find(s => s.IsDefault)
-                || subs[0];
-            if (t) {
-                subtitleStreamIndex = t.Index;
-                subtitleMethod = selectedSubtitleMode === 'burn' ? 'Encode' : 'Embed';
+        if (subMode !== 'none' && subs.length > 0 && !(subChecked && subChecked.size === 0)) {
+            const t = subChecked
+                ? primaryChecked(subs, subChecked)
+                : null;
+            const picked = t || (function () {
+                const lang = (selectedSubtitleLanguage || '').toLowerCase();
+                return (lang && subs.find(s => (s.Language || '').toLowerCase() === lang))
+                    || subs.find(s => s.IsDefault)
+                    || subs[0];
+            })();
+            if (picked) {
+                subtitleStreamIndex = picked.Index;
+                subtitleMethod = subMode === 'burn' ? 'Encode' : 'Embed';
             }
         }
         return {
@@ -1978,9 +2048,9 @@
         const pad = (n) => (Number.isFinite(Number(n)) ? String(n).padStart(2, '0') : '??');
         let filename;
         if (item.Type === 'Movie') {
-            filename = `${item.Name} (${item.ProductionYear || '????'})${suffix}.${ext}`;
+            filename = `${item.Name || 'Unknown movie'} (${item.ProductionYear || '????'})${suffix}.${ext}`;
         } else if (item.Type === 'Episode') {
-            filename = `${item.SeriesName} S${pad(item.ParentIndexNumber)}E${pad(item.IndexNumber)} - ${item.Name}${suffix}.${ext}`;
+            filename = `${item.SeriesName || 'Unknown series'} S${pad(item.ParentIndexNumber)}E${pad(item.IndexNumber)} - ${item.Name || 'Unknown episode'}${suffix}.${ext}`;
         } else {
             filename = `download${suffix}.${ext}`;
         }
