@@ -121,6 +121,13 @@ On Jellyfin 12+, legacy `?api_key=` auth is rejected server-side. This fork send
 session token correctly (header in-page, `?ApiKey=` for browser handoffs). If you see
 401s, hard-refresh first — a stale cached script is the usual cause.
 
+**Tapped Download in the Android app and nothing happened?**
+Hard-refresh the web view first (reopen the library view) so you have the latest script —
+a stale cached copy is the usual cause. On tap you should see a *"Handed to your
+browser"* notice; if the browser never opens, update the Jellyfin Android app (older
+versions lack the handoff bridge the plugin calls). If the browser opens but shows an
+error, open that same URL in the browser while on the same network as the server.
+
 **Batch stopped / tab closed mid-download.**
 Waiting items persist and resume from zero on next load (you'll get a notice). An
 interrupted file is never kept as a "success" — failed rows stay with Retry.
@@ -132,7 +139,7 @@ Prefer HEVC + hardware, or drop a rung.
 ## Development
 
 Prerequisites: .NET 10 SDK (`mcr.microsoft.com/dotnet/sdk:10.0` works for the Docker-only
-crowd) and Node.js (for the jsdom smoke tests in `../..` — see below).
+crowd) and Node.js (for the headless UI tests in [`tests/`](tests/) — see below).
 
 ```bash
 dotnet build src/JellyfinTranscodeDownloader.csproj -c Release
