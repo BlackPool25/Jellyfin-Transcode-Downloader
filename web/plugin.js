@@ -1097,8 +1097,21 @@
         return codec ? codec.id : null;
     }
 
+    // Smart default codec: the most efficient codec this server can encode AND this
+    // device can actually play. HEVC halves phone file sizes on Android/VLC/desktop;
+    // Apple native players choke on hev1/Opus-in-MP4, so they stay on H.264+AAC.
+    // AV1 is never auto-picked (slow software encodes, spotty mobile decode).
+    function smartDefaultVideoCodec() {
+        if (!codecCapabilitiesResolved) return DEFAULT_VIDEO_CODEC;
+        if (!isApplePlayer() && isCodecSelectable('video', 'hevc')) return 'hevc';
+        if (isCodecSelectable('video', DEFAULT_VIDEO_CODEC)) return DEFAULT_VIDEO_CODEC;
+        return firstSelectableCodec('video') || DEFAULT_VIDEO_CODEC;
+    }
+
     // A stored preference is only honoured if the server still offers that codec.
-    function resolveCodecPreference(kind, storageKey, fallback) {
+    // Otherwise the smart default wins over the plain H.264 fallback.
+    function resolveCodecPreference(kind, storageKey) {
+        const fallback = kind === 'video' ? smartDefaultVideoCodec() : DEFAULT_AUDIO_CODEC;
         const stored = readStoredCodec(storageKey);
         if (stored && isCodecSelectable(kind, stored)) return stored;
         if (isCodecSelectable(kind, fallback)) return fallback;
@@ -1148,8 +1161,8 @@
                         audio: parseCapabilityList(readField(payload, 'AudioCodecs')),
                     };
                     codecCapabilitiesResolved = true;
-                    selectedVideoCodec = resolveCodecPreference('video', STORAGE_VIDEO_CODEC, DEFAULT_VIDEO_CODEC);
-                    selectedAudioCodec = resolveCodecPreference('audio', STORAGE_AUDIO_CODEC, DEFAULT_AUDIO_CODEC);
+                    selectedVideoCodec = resolveCodecPreference('video', STORAGE_VIDEO_CODEC);
+                    selectedAudioCodec = resolveCodecPreference('audio', STORAGE_AUDIO_CODEC);
                     resolve();
                 } catch (err) {
                     giveUp(err);
@@ -1783,14 +1796,15 @@
             const tiers = sheetTiers();
             const factor = videoCodecFactor(selectedVideoCodec);
             // Recommended = best quality at or under the phone sweet spot (4M H.264-equiv),
-            // never exceeding the source. One tap for "best size for the quality".
+            // never exceeding the source: the FIRST rung that fits going down, i.e. the
+            // highest quality that still counts as phone-sized.
             const cap = Math.min(
                 currentSource && currentSource.Bitrate ? currentSource.Bitrate : Infinity,
                 4_000_000);
             let recIdx = tiers.length - 1;
-            tiers.forEach((t, i) => {
-                if (scaleBitrate(t.bitrate, factor) <= cap) recIdx = i;
-            });
+            for (let i = 0; i < tiers.length; i++) {
+                if (scaleBitrate(tiers[i].bitrate, factor) <= cap) { recIdx = i; break; }
+            }
 
             for (const [ti, tier] of tiers.entries()) {
                 const bitrate = scaleBitrate(tier.bitrate, factor);
