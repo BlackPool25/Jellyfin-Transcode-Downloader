@@ -1,7 +1,9 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Net.Http;
 using System.Threading;
+using System.Threading.Tasks;
 using MediaBrowser.Common.Configuration;
 using MediaBrowser.Controller.MediaEncoding;
 using MediaBrowser.Model.Configuration;
@@ -10,6 +12,7 @@ using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Primitives;
 
 namespace Jellyfin.Plugin.TranscodeDownloader
 {
@@ -134,6 +137,86 @@ namespace Jellyfin.Plugin.TranscodeDownloader
             }
 
             return result;
+        }
+
+        /// <summary>
+        /// GET /TranscodeDownloader/Download/{itemId} — proxies the server's own transcode
+        /// stream so the response carries a <c>Content-Disposition</c> filename. Used by the
+        /// Android browser handoff (and any direct link), which otherwise lands as
+        /// <c>stream.mp4</c> because Jellyfin's stream endpoint sends no filename.
+        /// Query params are the stream params (MediaSourceId, VideoBitrate, …, PlaySessionId,
+        /// DeviceId) plus <c>filename</c>; <c>ApiKey</c> is accepted for auth and stripped
+        /// before proxying to avoid dual-auth rejection on 12.x.
+        /// </summary>
+        [HttpGet("Download/{itemId}")]
+        [Authorize]
+        [ProducesResponseType(StatusCodes.Status200OK)]
+        public async Task<ActionResult> DownloadFile(
+            string itemId,
+            [FromQuery] string? filename,
+            CancellationToken cancellationToken)
+        {
+            var forwarded = new Dictionary<string, StringValues>(StringComparer.OrdinalIgnoreCase);
+            foreach (var kv in Request.Query)
+            {
+                if (kv.Key.Equals("filename", StringComparison.OrdinalIgnoreCase)
+                    || kv.Key.Equals("apikey", StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                forwarded[kv.Key] = kv.Value;
+            }
+
+            // Same box: Jellyfin's HTTP port serves the stream endpoint.
+            var port = Request.Host.Port ?? 8096;
+            var url = "http://localhost:" + port + "/Videos/" + itemId + "/stream.mp4" + QueryString.Create(forwarded);
+
+            // Deliberately not disposed: the response stream is consumed by FileStreamResult
+            // after this method returns. Serial download queue means one live client at a time.
+            var http = new HttpClient { Timeout = Timeout.InfiniteTimeSpan };
+            if (Request.Headers.TryGetValue("Authorization", out var auth))
+            {
+                http.DefaultRequestHeaders.TryAddWithoutValidation("Authorization", (string?)auth);
+            }
+
+            HttpResponseMessage upstream;
+            try
+            {
+                upstream = await http.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "[TranscodeDownloader] Transcode proxy request failed for item {ItemId}", itemId);
+                return StatusCode(StatusCodes.Status502BadGateway);
+            }
+
+            if (!upstream.IsSuccessStatusCode)
+            {
+                upstream.Dispose();
+                http.Dispose();
+                return StatusCode((int)upstream.StatusCode);
+            }
+
+            var stream = await upstream.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
+            return File(stream, "video/mp4", SanitizeFileName(filename), enableRangeProcessing: true);
+        }
+
+        /// <summary>
+        /// Filenames arrive from client-side metadata; strip what filesystems forbid.
+        /// </summary>
+        private static string SanitizeFileName(string? filename)
+        {
+            if (string.IsNullOrWhiteSpace(filename)) return "download.mp4";
+            var name = System.IO.Path.GetFileName(filename.Trim());
+            foreach (var c in System.IO.Path.GetInvalidFileNameChars())
+            {
+                name = name.Replace(c.ToString(), string.Empty);
+            }
+
+            name = name.Trim();
+            if (name.Length > 120) name = name.Substring(0, 120);
+            return string.IsNullOrEmpty(name) ? "download.mp4" : name;
         }
 
         /// <summary>

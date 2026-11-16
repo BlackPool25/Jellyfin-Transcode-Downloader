@@ -1,23 +1,20 @@
 (() => {
     const SUPPORTED_LOCALES = ['en-us', 'de', 'fr', 'es', 'zh-cn', 'nl'];
 
-    // Bitrate rungs, calibrated for H.264. Other codecs scale these by their efficiency
-    // factor so a given rung means roughly the same picture quality across codecs.
+    // Phone-first bitrate ladder, calibrated for H.264. Other codecs scale these by their
+    // efficiency factor so a given rung means roughly the same picture quality across codecs.
+    // maxWidth/maxHeight are sent to the server so a "720p" pick cannot come back at 1080p+.
+    // (Archive 2160p/1440p tiers were dropped: they defeat the phone-size goal and risk heavy
+    // 4K tone-map jobs on small servers.)
     const QUALITY_TIERS = [
-        { resolution: '2160p', bitrate: 120_000_000 },
-        { resolution: '2160p', bitrate:  80_000_000 },
-        { resolution: '2160p', bitrate:  60_000_000 },
-        { resolution: '2160p', bitrate:  40_000_000 },
-        { resolution: '2160p', bitrate:  20_000_000 },
-        { resolution: '1440p', bitrate:  15_000_000 },
-        { resolution: '1440p', bitrate:  10_000_000 },
-        { resolution: '1080p', bitrate:   8_000_000 },
-        { resolution: '1080p', bitrate:   6_000_000 },
-        { resolution: '720p',  bitrate:   4_000_000 },
-        { resolution: '720p',  bitrate:   3_000_000 },
-        { resolution: '720p',  bitrate:   1_500_000 },
-        { resolution: '480p',  bitrate:     720_000 },
-        { resolution: '360p',  bitrate:     420_000 },
+        { resolution: '1080p', bitrate: 6_000_000,  maxWidth: 1920, maxHeight: 1080 },
+        { resolution: '1080p', bitrate: 4_000_000,  maxWidth: 1920, maxHeight: 1080 },
+        { resolution: '720p',  bitrate: 3_000_000,  maxWidth: 1280, maxHeight: 720 },
+        { resolution: '720p',  bitrate: 2_500_000,  maxWidth: 1280, maxHeight: 720 },
+        { resolution: '720p',  bitrate: 1_500_000,  maxWidth: 1280, maxHeight: 720 },
+        { resolution: '720p',  bitrate: 1_200_000,  maxWidth: 1280, maxHeight: 720 },
+        { resolution: '480p',  bitrate:   800_000,  maxWidth: 854,  maxHeight: 480 },
+        { resolution: '480p',  bitrate:   500_000,  maxWidth: 854,  maxHeight: 480 },
     ];
 
     // --- Codecs ---
@@ -83,6 +80,39 @@
         return `${Math.round(bitrate / 1000)} kbps`;
     }
 
+    function formatSize(bytes) {
+        if (!bytes || bytes <= 0) return 'unknown size';
+        if (bytes >= 1_000_000_000) return `~${(bytes / 1_000_000_000).toFixed(1)} GB`;
+        return `~${Math.round(bytes / 1_000_000)} MB`;
+    }
+
+    // Jellyfin 12.x rejects the legacy lowercase ?api_key= query param (and dual
+    // query+header auth). In-page fetches carry the session token as an Authorization
+    // header; only the Android browser-handoff URL — which cannot carry headers —
+    // uses ?ApiKey= (capital A, the one 12.x still honours).
+    function authHeaders(token) {
+        return { 'Authorization': `MediaBrowser Token="${token}"` };
+    }
+
+    // Best-effort Apple player detection for the hev1 / Opus-in-MP4 warnings.
+    function isApplePlayer() {
+        const ua = navigator.userAgent || '';
+        if (/iPhone|iPad|iPod/i.test(ua)) return true;
+        // Safari on macOS, excluding Chromium-based browsers that also contain "Safari".
+        return /Safari/i.test(ua) && !/Chrome|Chromium|Edg|OPR/i.test(ua);
+    }
+
+    // Filenames come from server metadata (titles with /, :, ?, emoji...). Strip what
+    // Windows/FAT/exFAT forbid, collapse whitespace, cap length. Never return empty.
+    function sanitizeFilename(name, fallback) {
+        const cleaned = String(name == null ? '' : name)
+            .replace(/[/\\:*?"<>|\x00-\x1f]/g, '')
+            .replace(/\s+/g, ' ')
+            .trim()
+            .slice(0, 120);
+        return cleaned || fallback;
+    }
+
     // --- i18n ---
 
     // Fallback strings used when strings fetch fails or locale is en-us.
@@ -104,6 +134,8 @@
         BrowserHandoffHint: 'The Jellyfin Android app cannot save downloads itself, so this opens in your browser. The file is saved as stream.mp4 — rename it afterwards.',
         BrowserHandoffStarted: 'Handed to your browser — check its downloads.',
         BrowserHandoffFailed: 'Could not open your browser.',
+        AppleCodecWarning: 'Heads up: Apple players cannot play HEVC videos tagged hev1, and ignore Opus audio in MP4. Pick H.264 + AAC for iPhone/iPad.',
+        RetryDownload: 'Retry',
     };
 
     // Populated by initStrings(); null until loaded.
@@ -195,7 +227,9 @@
         const stopUrl = entry.stopUrl;
         entry.stopUrl = null; // never fire twice for the same job
         try {
-            fetch(stopUrl, { method: 'DELETE', keepalive: true }).catch((err) => {
+            const init = { method: 'DELETE', keepalive: true };
+            if (entry.token) init.headers = authHeaders(entry.token);
+            fetch(stopUrl, init).catch((err) => {
                 console.warn('[TranscodeDownloader] failed to stop server transcode:', err);
             });
         } catch (err) {
@@ -210,9 +244,9 @@
         downloadQueue.forEach(stopActiveEncoding);
     });
 
-    function buildStopUrl(baseUrl, deviceId, playSessionId, token) {
+    function buildStopUrl(baseUrl, deviceId, playSessionId) {
         return `${baseUrl}/Videos/ActiveEncodings?deviceId=${encodeURIComponent(deviceId)}`
-            + `&playSessionId=${playSessionId}&api_key=${token}`;
+            + `&playSessionId=${encodeURIComponent(playSessionId)}`;
     }
 
     // --- Deferred transcode cleanup (browser handoff only) ---
@@ -264,8 +298,8 @@
             const token = client.accessToken();
             const baseUrl = client.serverAddress() || window.location.origin;
             due.forEach((entry) => {
-                const url = buildStopUrl(entry.baseUrl || baseUrl, entry.deviceId, entry.playSessionId, token);
-                fetch(url, { method: 'DELETE' }).catch((err) => {
+                const url = buildStopUrl(entry.baseUrl || baseUrl, entry.deviceId, entry.playSessionId);
+                fetch(url, { method: 'DELETE', headers: authHeaders(token) }).catch((err) => {
                     console.warn('[TranscodeDownloader] deferred transcode stop failed:', err);
                 });
             });
@@ -279,8 +313,77 @@
         });
     }
 
+    // Waiting/failed rows survive a reload: specs (no bytes, no tokens, no file handles)
+    // are cheap to keep. On load they restart from zero — labelled honestly, never "resume".
+    const STORAGE_QUEUE = 'transcodeDownloader.queue.v1';
+
+    function persistWaitingQueue() {
+        try {
+            const rows = downloadQueue
+                .filter(e => (e.status === 'waiting' || e.status === 'failed') && e.spec)
+                .map(e => ({ spec: e.spec }));
+            window.localStorage.setItem(STORAGE_QUEUE, JSON.stringify(rows.slice(0, 50)));
+        } catch (_) { /* private mode etc: queue just won't persist */ }
+    }
+
+    function restoreWaitingQueue() {
+        let rows = [];
+        try {
+            const raw = window.localStorage.getItem(STORAGE_QUEUE);
+            rows = raw ? JSON.parse(raw) : [];
+        } catch (_) { return; }
+        if (!Array.isArray(rows) || rows.length === 0) return;
+        for (const row of rows) {
+            if (!row || !row.spec || !row.spec.item) continue;
+            try {
+                const parts = buildDownloadParts(row.spec);
+                downloadQueue.push({
+                    id: `${row.spec.itemId}-restored-${Date.now()}-${Math.floor(Math.random() * 1e6)}`,
+                    spec: row.spec,
+                    token: null, // refreshed from the live session when processed
+                    fileHandle: null, // handles don't survive reloads: Blob fallback
+                    filename: parts.filename,
+                    estimatedBytes: parts.estimatedBytes,
+                    url: parts.url,
+                    stopUrl: parts.stopUrl,
+                    videoCodec: parts.videoCodec,
+                    audioCodec: parts.audioCodec,
+                    codecLabel: parts.codecLabel,
+                    receivedBytes: 0,
+                    abortController: null,
+                    status: 'waiting',
+                });
+            } catch (err) {
+                console.warn('[TranscodeDownloader] dropping unrestorable queue row:', err);
+            }
+        }
+        try { window.localStorage.removeItem(STORAGE_QUEUE); } catch (_) { /* noop */ }
+        renderQueue();
+    }
+
+    // Tokens expire; a restored entry has none. Refresh inline before its fetch.
+    function ensureEntryToken(entry) {
+        if (entry.token) return Promise.resolve();
+        return new Promise((resolve) => {
+            getApiClient(0, 10, (client) => {
+                entry.token = client.accessToken();
+                resolve();
+            }, () => resolve());
+        });
+    }
+
+    // A reload mid-download kills the transfer; say so instead of silently dropping it.
+    window.addEventListener('beforeunload', (e) => {
+        if (downloadQueue.some(en => en.status === 'active')) {
+            persistWaitingQueue();
+            e.preventDefault();
+            e.returnValue = '';
+        }
+    });
+
     function enqueue(entry) {
         downloadQueue.push(entry);
+        persistWaitingQueue();
         renderQueue();
         if (!queueProcessing) processQueue();
     }
@@ -293,47 +396,84 @@
             entry.abortController.abort();
         }
         downloadQueue.splice(idx, 1);
+        persistWaitingQueue();
         renderQueue();
         // If we cancelled the active item, processQueue will be called by the fetch .finally
     }
 
+    function retryQueueEntry(id) {
+        const entry = downloadQueue.find(e => e.id === id);
+        if (!entry || entry.status !== 'failed' || !entry.spec) return;
+        // Fresh session ids: reusing a PlaySessionId can resume a stale server job.
+        const parts = buildDownloadParts(entry.spec);
+        entry.url = parts.url;
+        entry.stopUrl = parts.stopUrl;
+        entry.filename = parts.filename;
+        entry.estimatedBytes = parts.estimatedBytes;
+        entry.receivedBytes = 0;
+        entry.error = null;
+        entry.status = 'waiting';
+        entry.abortController = null;
+        persistWaitingQueue();
+        renderQueue();
+        if (!queueProcessing) processQueue();
+    }
+
     async function processQueue() {
         if (queueProcessing) return;
-        if (downloadQueue.length === 0) return;
+        if (!downloadQueue.some(e => e.status === 'waiting')) return;
 
         queueProcessing = true;
-        while (downloadQueue.length > 0) {
-            const entry = downloadQueue[0];
+        for (;;) {
+            const entry = downloadQueue.find(e => e.status === 'waiting');
+            if (!entry) break;
             entry.status = 'active';
             entry.abortController = new AbortController();
             renderQueue();
 
             try {
-                const response = await fetch(entry.url, { signal: entry.abortController.signal });
+                await ensureEntryToken(entry);
+                const init = { signal: entry.abortController.signal };
+                if (entry.token) init.headers = authHeaders(entry.token);
+                const response = await fetch(entry.url, init);
                 if (!response.ok) {
                     const httpError = new Error(`HTTP ${response.status}`);
                     httpError.status = response.status;
                     throw httpError;
                 }
-                const blob = await readStream(response.body, entry.estimatedBytes, entry);
-                triggerBlobDownload(blob, entry.filename);
-                updateEntryProgress(entry, 1, entry.estimatedBytes);
+                if (entry.fileHandle) {
+                    // Stream straight to disk: no 2x-RAM Blob, phone-safe for 2 GB+ files.
+                    const writable = await entry.fileHandle.createWritable();
+                    await saveStreamToDisk(response.body, writable, entry.estimatedBytes, entry);
+                    updateEntryProgress(entry, 1, entry.estimatedBytes);
+                } else {
+                    const blob = await readStream(response.body, entry.estimatedBytes, entry);
+                    triggerBlobDownload(blob, entry.filename);
+                    updateEntryProgress(entry, 1, entry.estimatedBytes);
+                }
                 await new Promise(r => setTimeout(r, 1000));
+
+                // Success: job done, clean up and drop the row.
+                stopActiveEncoding(entry);
+                const idx = downloadQueue.indexOf(entry);
+                if (idx !== -1) downloadQueue.splice(idx, 1);
             } catch (err) {
-                if (err.name !== 'AbortError') {
+                if (err.name === 'AbortError') {
+                    // Cancelled by the user: drop the row like before.
+                    stopActiveEncoding(entry);
+                    const idx = downloadQueue.indexOf(entry);
+                    if (idx !== -1) downloadQueue.splice(idx, 1);
+                } else {
+                    // Failed: stop the server job but KEEP the row with the reason,
+                    // so the user can retry instead of re-picking codec and tier.
                     console.error('[TranscodeDownloader] Download failed:', err);
-                    updateEntryStatus(entry, describeFailure(entry, err));
-                    await new Promise(r => setTimeout(r, 3000));
+                    stopActiveEncoding(entry);
+                    entry.status = 'failed';
+                    entry.error = describeFailure(entry, err);
+                    entry.abortController = null;
                 }
             }
-
-            // Whether the download finished, failed, or was aborted, the server-side job is done
-            // with — and it will not clean up its own temp file.
-            stopActiveEncoding(entry);
-
-            // Remove this entry (whether done, failed, or aborted)
-            const idx = downloadQueue.indexOf(entry);
-            if (idx !== -1) downloadQueue.splice(idx, 1);
+            persistWaitingQueue();
             renderQueue();
         }
         queueProcessing = false;
@@ -352,6 +492,28 @@
     }
 
     // --- Stream reader ---
+
+    async function saveStreamToDisk(body, writable, estimatedBytes, entry) {
+        const reader = body.getReader();
+        let received = 0;
+        try {
+            for (;;) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                await writable.write(value);
+                received += value.byteLength;
+                entry.receivedBytes = received;
+                updateEntryProgress(entry, estimatedBytes ? received / estimatedBytes : 0, estimatedBytes, received);
+            }
+            if (received === 0) throw new Error('Transcode produced no data');
+            await writable.close();
+        } catch (err) {
+            try { await writable.abort(); } catch (_) { /* already closed */ }
+            throw err;
+        } finally {
+            try { reader.releaseLock(); } catch (_) { /* noop */ }
+        }
+    }
 
     async function readStream(body, estimatedBytes, entry) {
         const reader = body.getReader();
@@ -430,7 +592,14 @@
                 cancelBtn.style.cssText = 'padding:2px 8px;border-radius:4px;border:1px solid #666;background:#333;color:#fff;cursor:pointer;font-size:12px;flex-shrink:0;';
                 cancelBtn.addEventListener('click', () => removeFromQueue(entry.id));
 
+                const retryBtn = document.createElement('button');
+                retryBtn.textContent = t('RetryDownload');
+                retryBtn.className = 'qd-retry';
+                retryBtn.style.cssText = 'display:none;padding:2px 8px;border-radius:4px;border:1px solid #00a4dc;background:rgba(0,164,220,0.2);color:#fff;cursor:pointer;font-size:12px;flex-shrink:0;';
+                retryBtn.addEventListener('click', () => retryQueueEntry(entry.id));
+
                 top.appendChild(name);
+                top.appendChild(retryBtn);
                 top.appendChild(cancelBtn);
                 row.appendChild(top);
 
@@ -463,15 +632,22 @@
                 else list.appendChild(row);
             }
 
-            // Update active/waiting appearance without touching the fill width
+            // Update active/waiting/failed appearance without touching the fill width
             const track = row.querySelector('.qd-track');
             const statusEl = row.querySelector(`#qd-status-${entry.id}`);
+            const retryBtn = row.querySelector('.qd-retry');
             if (entry.status === 'active') {
                 if (track) track.style.display = 'block';
                 if (statusEl) statusEl.style.color = '#aaa';
+                if (retryBtn) retryBtn.style.display = 'none';
+            } else if (entry.status === 'failed') {
+                if (track) track.style.display = 'none';
+                if (statusEl) { statusEl.style.color = '#e06c60'; statusEl.textContent = entry.error || t('DownloadFailed'); }
+                if (retryBtn) retryBtn.style.display = '';
             } else {
                 if (track) track.style.display = 'none';
                 if (statusEl) { statusEl.style.color = '#666'; statusEl.textContent = t('Waiting'); }
+                if (retryBtn) retryBtn.style.display = 'none';
             }
         });
     }
@@ -481,10 +657,16 @@
         const statusEl = document.getElementById(`qd-status-${entry.id}`);
         if (!fill || !statusEl) return;
 
+        const receivedMB = receivedBytes != null ? (receivedBytes / 1_048_576).toFixed(1) : null;
+        if (!estimatedBytes) {
+            // Runtime unknown: show bytes only, never NaN%.
+            fill.style.width = receivedMB != null ? '100%' : '0%';
+            statusEl.textContent = receivedMB != null ? `${receivedMB} MB downloaded` : '';
+            return;
+        }
         const pct = Math.min(Math.round(ratio * 100), 100);
         fill.style.width = pct + '%';
 
-        const receivedMB = receivedBytes != null ? (receivedBytes / 1_048_576).toFixed(1) : null;
         const estimatedMB = (estimatedBytes / 1_048_576).toFixed(1);
         statusEl.textContent = receivedMB != null
             ? `${receivedMB} MB / ~${estimatedMB} MB · ${pct}%`
@@ -716,7 +898,9 @@
             getApiClient(0, 10, async (client) => {
                 try {
                     const baseUrl = client.serverAddress() || window.location.origin;
-                    const res = await fetch(`${baseUrl}/TranscodeDownloader/Codecs?api_key=${encodeURIComponent(client.accessToken())}`);
+                    const res = await fetch(`${baseUrl}/TranscodeDownloader/Codecs`, {
+                        headers: authHeaders(client.accessToken()),
+                    });
                     if (!res.ok) throw new Error(`HTTP ${res.status}`);
                     const payload = await res.json();
 
@@ -976,24 +1160,204 @@
             return;
         }
 
-        const source = item && item.MediaSources && item.MediaSources[0];
-        // Filtered on the H.264-calibrated base bitrate so the set of rungs on offer stays
-        // stable when the codec changes — only their encoder targets move.
-        const tiers = source && source.Bitrate
-            ? QUALITY_TIERS.filter(tier => tier.bitrate < source.Bitrate)
+        resetTrackSelections();
+        const mediaSources = (item && item.MediaSources) || [];
+        let currentSource = mediaSources[0] || null;
+
+        // Rungs follow the selected media source: multi-version items (4K + 1080p)
+        // would otherwise filter tiers against the wrong bitrate.
+        const sheetTiers = () => (currentSource && currentSource.Bitrate)
+            ? QUALITY_TIERS.filter(tier => tier.bitrate <= currentSource.Bitrate)
             : QUALITY_TIERS;
+
+        function trackLabel(s) {
+            const lang = s.Language || s.DisplayLanguage || 'und';
+            const title = s.DisplayTitle || s.Title || s.Codec || '';
+            const ch = s.Channels ? ` ${s.Channels}ch` : '';
+            return `${lang} · ${title}${ch}`.trim();
+        }
+
+        function initTrackDefaults(src) {
+            const streams = (src && src.MediaStreams) || [];
+            const audios = streams.filter(s => s.Type === 'Audio');
+            const subs = streams.filter(s => s.Type === 'Subtitle');
+            const defAudio = audios.find(s => s.IsDefault) || audios[0] || null;
+            selectedAudioStreamIndex = defAudio ? defAudio.Index : null;
+            selectedAudioLanguage = (defAudio && (defAudio.Language || defAudio.DisplayLanguage)) || null;
+            if (subs.length === 0) {
+                selectedSubtitleMode = 'none';
+                selectedSubtitleStreamIndex = null;
+                selectedSubtitleLanguage = null;
+            } else {
+                // Burn-in is the default: the only faithful path for styled ASS and
+                // image subs (PGS), which dominate anime libraries.
+                selectedSubtitleMode = 'burn';
+                const defSub = subs.find(s => s.IsDefault)
+                    || subs.find(s => (s.Language || '').toLowerCase().startsWith('eng'))
+                    || subs[0];
+                selectedSubtitleStreamIndex = defSub ? defSub.Index : null;
+                selectedSubtitleLanguage = (defSub && (defSub.Language || defSub.DisplayLanguage)) || null;
+            }
+        }
+
+        function selectRow(labelText, options, currentValue, onPick) {
+            const wrap = document.createElement('div');
+            const title = document.createElement('div');
+            title.style.cssText = 'font-size:13px;font-weight:600;color:#fff;opacity:0.7;margin-bottom:6px;';
+            title.textContent = labelText;
+            wrap.appendChild(title);
+            const sel = document.createElement('select');
+            sel.style.cssText = 'width:100%;padding:8px;border-radius:6px;background:#222;color:#fff;border:1px solid #444;font-size:13px;';
+            options.forEach(o => {
+                const opt = document.createElement('option');
+                opt.value = o.value;
+                opt.textContent = o.label;
+                if (o.value === currentValue) opt.selected = true;
+                sel.appendChild(opt);
+            });
+            sel.addEventListener('change', () => onPick(sel.value === '' ? null : Number(sel.value)));
+            wrap.appendChild(sel);
+            return wrap;
+        }
+
+        function buildTrackSection() {
+            const section = document.createElement('div');
+            section.style.cssText = 'padding:4px 20px 8px;display:flex;flex-direction:column;gap:10px;';
+            const render = () => {
+                section.textContent = '';
+                const streams = (currentSource && currentSource.MediaStreams) || [];
+                const audios = streams.filter(s => s.Type === 'Audio');
+                const subs = streams.filter(s => s.Type === 'Subtitle');
+
+                if (mediaSources.length > 1) {
+                    section.appendChild(selectRow('Version', mediaSources.map((ms, i) => ({
+                        value: i,
+                        label: `${ms.Name || `Version ${i + 1}`}${ms.Size ? ` · ${(ms.Size / 1_000_000).toFixed(0)} MB` : ''}`,
+                    })), mediaSources.indexOf(currentSource), (i) => {
+                        currentSource = mediaSources[i == null ? 0 : i];
+                        selectedMediaSourceId = currentSource.Id;
+                        initTrackDefaults(currentSource);
+                        render();
+                        refreshTiers();
+                        updateSourceInfo();
+                    }));
+                }
+
+                if (audios.length > 1) {
+                    section.appendChild(selectRow('Audio track', audios.map(a => ({
+                        value: a.Index, label: trackLabel(a),
+                    })), selectedAudioStreamIndex, (v) => {
+                        selectedAudioStreamIndex = v;
+                        const picked = audios.find(a => a.Index === v);
+                        selectedAudioLanguage = picked ? (picked.Language || picked.DisplayLanguage || null) : null;
+                    }));
+                }
+
+                if (subs.length > 0) {
+                    const modes = [
+                        { id: 'none', label: 'No subtitles' },
+                        { id: 'embed', label: 'Soft subs' },
+                        { id: 'burn', label: 'Burn in' },
+                    ];
+                    const modeWrap = document.createElement('div');
+                    const modeTitle = document.createElement('div');
+                    modeTitle.style.cssText = 'font-size:13px;font-weight:600;color:#fff;opacity:0.7;margin-bottom:6px;';
+                    modeTitle.textContent = 'Subtitles';
+                    modeWrap.appendChild(modeTitle);
+                    const chips = document.createElement('div');
+                    chips.style.cssText = 'display:flex;flex-wrap:wrap;gap:8px;';
+                    modes.forEach(m => {
+                        const chip = document.createElement('button');
+                        chip.type = 'button';
+                        chip.textContent = m.label;
+                        const active = selectedSubtitleMode === m.id;
+                        chip.style.cssText = 'padding:6px 14px;border-radius:16px;font-size:13px;font-family:inherit;color:#fff;cursor:pointer;'
+                            + `border:1px solid ${active ? '#00a4dc' : '#444'};`
+                            + `background:${active ? 'rgba(0,164,220,0.2)' : 'transparent'};`;
+                        chip.setAttribute('aria-pressed', active ? 'true' : 'false');
+                        chip.addEventListener('click', () => {
+                            selectedSubtitleMode = m.id;
+                            if (m.id === 'none') selectedSubtitleStreamIndex = null;
+                            else if (selectedSubtitleStreamIndex == null && subs.length > 0) {
+                                selectedSubtitleStreamIndex = subs[0].Index;
+                                selectedSubtitleLanguage = subs[0].Language || null;
+                            }
+                            render();
+                        });
+                        chips.appendChild(chip);
+                    });
+                    modeWrap.appendChild(chips);
+                    if (selectedSubtitleMode !== 'none') {
+                        const row = selectRow('', subs.map(s => ({
+                            value: s.Index, label: trackLabel(s),
+                        })), selectedSubtitleStreamIndex, (v) => {
+                            selectedSubtitleStreamIndex = v;
+                            const picked = subs.find(s => s.Index === v);
+                            selectedSubtitleLanguage = picked ? (picked.Language || picked.DisplayLanguage || null) : null;
+                        });
+                        row.firstChild.remove(); // drop the empty title, keep the select
+                        modeWrap.appendChild(row);
+                    }
+                    section.appendChild(modeWrap);
+                }
+            };
+            render();
+            return section;
+        }
+
+        if (currentSource) {
+            selectedMediaSourceId = currentSource.Id;
+            initTrackDefaults(currentSource);
+        }
+        sheet.appendChild(buildTrackSection());
+
+        const durationSeconds = item.RunTimeTicks ? item.RunTimeTicks / 10_000_000 : 0;
+
+        const infoEl = document.createElement('div');
+        infoEl.style.cssText = 'padding:0 20px 8px;font-size:12px;color:#888;';
+        sheet.appendChild(infoEl);
+
+        function updateSourceInfo() {
+            infoEl.style.color = '#888';
+            const src = currentSource;
+            const sourceMB = src && src.Size ? (src.Size / 1_000_000).toFixed(0) : null;
+            infoEl.textContent = sourceMB ? `Original ~${sourceMB} MB on server` : '';
+            if (navigator.storage && navigator.storage.estimate) {
+                navigator.storage.estimate().then(({ quota }) => {
+                    if (!quota) return;
+                    const freeGB = (quota / 1_000_000_000).toFixed(0);
+                    infoEl.textContent += ` · Free on this device ~${freeGB} GB`;
+                    const rungTiers = sheetTiers();
+                    const biggest = rungTiers.length
+                        ? scaleBitrate(Math.max(...rungTiers.map(x => x.bitrate)), videoCodecFactor(selectedVideoCodec)) * (durationSeconds || 0) / 8
+                        : 0;
+                    if (biggest > quota) {
+                        infoEl.textContent += ' — biggest rung may not fit!';
+                        infoEl.style.color = '#d0a24c';
+                    }
+                }).catch(() => { /* storage estimate unavailable */ });
+            }
+        }
+        updateSourceInfo();
 
         const tierList = document.createElement('div');
 
         const renderTiers = () => {
             tierList.textContent = '';
+            const tiers = sheetTiers();
             const factor = videoCodecFactor(selectedVideoCodec);
 
             for (const tier of tiers) {
                 const bitrate = scaleBitrate(tier.bitrate, factor);
-                const btn = makeMenuItem('video_settings', `${tier.resolution} · ${formatBitrate(bitrate)}`, () => {
+                const sizeHint = durationSeconds > 0 ? ` · ${formatSize(bitrate * durationSeconds / 8)}` : '';
+                const btn = makeMenuItem('video_settings', `${tier.resolution} · ${formatBitrate(bitrate)}${sizeHint}`, () => {
                     scrim.remove();
-                    onTranscodeMenuClick(bitrate, item.Id || itemId, item);
+                    if (batchSeason) {
+                        queueSeason(item.SeasonId, tier, bitrate, videoCodec, audioCodec);
+                    } else {
+                        onTranscodeMenuClick(tier, bitrate, item.Id || itemId, item,
+                            resolveEpisodeTracks(item, currentSource));
+                    }
                 });
                 tierList.appendChild(btn);
             }
@@ -1006,10 +1370,24 @@
             }
         };
 
+        // Apple players refuse hev1-tagged HEVC and ignore Opus-in-MP4. The server still
+        // offers those codecs, so warn instead of hiding — the user may be downloading
+        // for VLC on the same iPhone.
+        const appleWarn = document.createElement('div');
+        appleWarn.style.cssText = 'display:none;padding:0 20px 8px;font-size:12px;color:#d0a24c;';
+        appleWarn.textContent = t('AppleCodecWarning');
+
+        const refreshTiers = () => {
+            renderTiers();
+            const risky = selectedVideoCodec === 'hevc' || selectedAudioCodec === 'opus';
+            appleWarn.style.display = (isApplePlayer() && risky) ? '' : 'none';
+        };
+
         // Only offered when the server told us what it can encode; otherwise the flow stays
         // exactly as it was, on H.264/AAC.
         if (codecCapabilitiesResolved) {
-            sheet.insertBefore(buildCodecSection(renderTiers), header);
+            sheet.insertBefore(buildCodecSection(refreshTiers), header);
+            sheet.insertBefore(appleWarn, header);
         }
 
         // Said before the choice, not after: picking a tier in the app leaves for the browser
@@ -1021,29 +1399,171 @@
             sheet.appendChild(handoffHint);
         }
 
-        renderTiers();
+        // Season batch: arm with this button, then tap any tier to enqueue every episode
+        // at that tier/codec with the same track languages. Batch rows use in-memory
+        // downloads (no save picker can open for 12 files from one tap).
+        let batchSeason = false;
+        if (item.Type === 'Episode' && item.SeasonId && !isAndroidAppWebView()) {
+            const batchBtn = makeMenuItem('video_library', 'Queue season…', () => {
+                batchSeason = true;
+                batchBtn.style.opacity = '0.5';
+                showTransientNotice('Season batch armed — tap a quality to queue every episode.');
+            });
+            sheet.appendChild(batchBtn);
+        }
+
+        refreshTiers();
         sheet.appendChild(tierList);
+    }
+
+    function queueSeason(seasonId, tier, bitrate, videoCodec, audioCodec) {
+        getApiClient(0, 5, async (client) => {
+            const token = client.accessToken();
+            const baseUrl = client.serverAddress() || window.location.origin;
+            let episodes = [];
+            try {
+                const res = await client.getItems(client.getCurrentUserId(), {
+                    ParentId: seasonId,
+                    IncludeItemTypes: 'Episode',
+                    Fields: 'MediaSources,ParentIndexNumber,IndexNumber,Name,SeriesName,RunTimeTicks,ProductionYear,Type',
+                    SortBy: 'ParentIndexNumber,IndexNumber',
+                    SortOrder: 'Ascending',
+                    Recursive: true,
+                });
+                episodes = (res && res.Items) || [];
+            } catch (err) {
+                console.error('[TranscodeDownloader] season fetch failed:', err);
+                showTransientNotice(t('DownloadFailed'));
+                return;
+            }
+            if (episodes.length === 0) {
+                showTransientNotice(t('NoTranscodeOptions'));
+                return;
+            }
+            let queued = 0;
+            for (const ep of episodes) {
+                const sources = ep.MediaSources || [];
+                if (sources.length === 0) continue;
+                const src = sources[0];
+                const tracks = resolveEpisodeTracks(ep, src);
+                const spec = {
+                    baseUrl, itemId: ep.Id, tier, bitrate, item: ep, videoCodec, audioCodec,
+                    mediaSourceId: tracks.mediaSourceId,
+                    audioStreamIndex: tracks.audioStreamIndex,
+                    subtitleStreamIndex: tracks.subtitleStreamIndex,
+                    subtitleMethod: tracks.subtitleMethod,
+                };
+                addToQueue(token, spec, null);
+                queued += 1;
+            }
+            showTransientNotice(`Queued ${queued} episode${queued === 1 ? '' : 's'}.`);
+        });
+    }
+
+    // Current sheet's track choices. Reset on every sheet open; the click handler copies
+    // them into the entry spec so retries, restores and season batches reuse them.
+    let selectedMediaSourceId = null;
+    let selectedAudioStreamIndex = null; // null = server default
+    let selectedSubtitleMode = 'burn'; // 'burn' | 'embed' | 'none'
+    let selectedSubtitleStreamIndex = null; // null = none
+    let selectedAudioLanguage = null;
+    let selectedSubtitleLanguage = null;
+
+    function resetTrackSelections() {
+        selectedMediaSourceId = null;
+        selectedAudioStreamIndex = null;
+        selectedSubtitleMode = 'burn';
+        selectedSubtitleStreamIndex = null;
+        selectedAudioLanguage = null;
+        selectedSubtitleLanguage = null;
+    }
+
+    // The save picker must open inside the tier-click gesture; browsers reject it from
+    // async queue processing later. No picker (Firefox, insecure context) = Blob fallback.
+    async function pickSaveFile(suggestedName) {
+        if (typeof window.showSaveFilePicker !== 'function') return null;
+        try {
+            return await window.showSaveFilePicker({
+                suggestedName,
+                types: [{ description: 'MP4 video', accept: { 'video/mp4': ['.mp4'] } }],
+            });
+        } catch (err) {
+            // AbortError = user cancelled the dialog: not a failure, just stop.
+            if (err && err.name === 'AbortError') return 'cancelled';
+            console.warn('[TranscodeDownloader] save picker unavailable, using in-memory download:', err);
+            return null;
+        }
     }
 
     // --- Download actions ---
 
-    function onTranscodeMenuClick(bitrate, itemId, item) {
+    // Per-episode track resolution shared by single and season-batch downloads:
+    // same audio language as picked, same subtitle mode+language, falling back to
+    // server defaults. Keeps a 12-episode batch consistent without 12 pickers.
+    function resolveEpisodeTracks(epItem, src) {
+        const streams = (src && src.MediaStreams) || [];
+        const audios = streams.filter(s => s.Type === 'Audio');
+        const subs = streams.filter(s => s.Type === 'Subtitle');
+        let audioStreamIndex = null;
+        if (audios.length > 0) {
+            const lang = (selectedAudioLanguage || '').toLowerCase();
+            const t = (lang && audios.find(a => (a.Language || '').toLowerCase() === lang))
+                || audios.find(a => a.IsDefault)
+                || audios[0];
+            audioStreamIndex = t ? t.Index : null;
+        }
+        let subtitleStreamIndex = null;
+        let subtitleMethod = null;
+        if (selectedSubtitleMode !== 'none' && subs.length > 0) {
+            const lang = (selectedSubtitleLanguage || '').toLowerCase();
+            const t = (lang && subs.find(s => (s.Language || '').toLowerCase() === lang))
+                || subs.find(s => s.IsDefault)
+                || subs[0];
+            if (t) {
+                subtitleStreamIndex = t.Index;
+                subtitleMethod = selectedSubtitleMode === 'burn' ? 'Encode' : 'Embed';
+            }
+        }
+        return {
+            mediaSourceId: src && src.Id ? src.Id : null,
+            audioStreamIndex, subtitleStreamIndex, subtitleMethod,
+        };
+    }
+
+    function onTranscodeMenuClick(tier, bitrate, itemId, item, tracks) {
         if (!item) return;
         // Captured now: the sheet is gone, but the selection must not drift before the
-        // ApiClient callback runs.
+        // ApiClient callback runs. Track choices are baked into the spec at click time.
         const videoCodec = selectedVideoCodec;
         const audioCodec = selectedAudioCodec;
-        getApiClient(0, 5, (client) => {
+        const spec = {
+            baseUrl: null, itemId, tier, bitrate, item, videoCodec, audioCodec,
+            mediaSourceId: tracks && tracks.mediaSourceId != null ? tracks.mediaSourceId : selectedMediaSourceId,
+            audioStreamIndex: tracks ? tracks.audioStreamIndex : selectedAudioStreamIndex,
+            subtitleStreamIndex: tracks ? tracks.subtitleStreamIndex : selectedSubtitleStreamIndex,
+            subtitleMethod: tracks
+                ? tracks.subtitleMethod
+                : (selectedSubtitleMode === 'burn' ? 'Encode'
+                    : selectedSubtitleMode === 'embed' ? 'Embed' : null),
+        };
+        getApiClient(0, 5, async (client) => {
             const token = client.accessToken();
             const baseUrl = client.serverAddress() || window.location.origin;
-            addToQueue(baseUrl, itemId, token, bitrate, item, videoCodec, audioCodec);
+            spec.baseUrl = baseUrl;
+            const suggestedName = buildDownloadParts(spec).filename;
+            const fileHandle = await pickSaveFile(suggestedName);
+            if (fileHandle === 'cancelled') return;
+            addToQueue(token, spec, fileHandle);
         });
     }
 
-    function addToQueue(baseUrl, itemId, token, selectedBitrate, item, videoCodec, audioCodec) {
-        const mediaSourceId = item.MediaSources && item.MediaSources[0] && item.MediaSources[0].Id
-            ? item.MediaSources[0].Id
-            : itemId;
+    // Pure builder so a failed entry can be retried with fresh session ids without
+    // re-picking codec and tier. Nothing here touches the queue or the network.
+    function buildDownloadParts(spec) {
+        const { baseUrl, itemId, tier, bitrate, item, videoCodec, audioCodec } = spec;
+        const mediaSource = (item.MediaSources || []).find(s => s.Id === spec.mediaSourceId)
+            || item.MediaSources[0];
+        const mediaSourceId = mediaSource && mediaSource.Id ? mediaSource.Id : itemId;
         // Identifies the server-side transcoding job so it can be killed (and its temp file
         // deleted) once the download ends. Both are per-download and synthetic: the pair also
         // seeds the transcode's output filename, so a fresh id keeps a new download from picking
@@ -1053,42 +1573,70 @@
         const deviceId = `transcode-downloader-${playSessionId}`;
         // A single codec is sent deliberately: a comma-separated list lets the server silently
         // downgrade while the UI still claims the codec the user picked.
-        const url = `${baseUrl}/Videos/${itemId}/stream.mp4?MediaSourceId=${mediaSourceId}&VideoBitrate=${selectedBitrate}&VideoCodec=${videoCodec}&AudioCodec=${audioCodec}&MaxAudioChannels=2&allowVideoStreamCopy=false&allowAudioStreamCopy=false&Static=false&PlaySessionId=${playSessionId}&DeviceId=${encodeURIComponent(deviceId)}&api_key=${token}`;
-        // Nothing below this point applies inside the Android app: there is no queue entry, no
-        // progress and no filename of ours once the browser owns the transfer.
-        if (isAndroidAppWebView()) {
-            handOffToBrowser(url, baseUrl, deviceId, playSessionId);
-            return;
-        }
-
-        const stopUrl = buildStopUrl(baseUrl, deviceId, playSessionId, token);
+        // MaxWidth/MaxHeight pin the picked rung — VideoBitrate alone lets the server
+        // return a higher resolution than the label promises.
+        const query = `MediaSourceId=${mediaSourceId}`
+            + `&VideoBitrate=${bitrate}&MaxWidth=${tier.maxWidth}&MaxHeight=${tier.maxHeight}`
+            + `&VideoCodec=${videoCodec}&AudioCodec=${audioCodec}&MaxAudioChannels=2`
+            + (spec.audioStreamIndex != null ? `&AudioStreamIndex=${spec.audioStreamIndex}` : '')
+            + (spec.subtitleStreamIndex != null && spec.subtitleMethod
+                ? `&SubtitleStreamIndex=${spec.subtitleStreamIndex}&SubtitleMethod=${spec.subtitleMethod}` : '')
+            + `&allowVideoStreamCopy=false&allowAudioStreamCopy=false&Static=false`
+            + `&PlaySessionId=${playSessionId}&DeviceId=${encodeURIComponent(deviceId)}`;
+        const url = `${baseUrl}/Videos/${itemId}/stream.mp4?${query}`;
+        const stopUrl = buildStopUrl(baseUrl, deviceId, playSessionId);
 
         const videoTag = codecTag(VIDEO_CODECS, videoCodec);
         const audioTag = codecTag(AUDIO_CODECS, audioCodec);
-        const suffix = ` [${videoTag} ${formatBitrate(selectedBitrate).replace(' ', '')} ${audioTag}]`;
+        const suffix = ` [${videoTag} ${formatBitrate(bitrate).replace(' ', '')} ${audioTag}]`;
 
-        const pad = (n) => String(n).padStart(2, '0');
+        const pad = (n) => (Number.isFinite(Number(n)) ? String(n).padStart(2, '0') : '??');
         let filename;
         if (item.Type === 'Movie') {
-            filename = `${item.Name} (${item.ProductionYear})${suffix}.mp4`;
+            filename = `${item.Name} (${item.ProductionYear || '????'})${suffix}.mp4`;
         } else if (item.Type === 'Episode') {
             filename = `${item.SeriesName} S${pad(item.ParentIndexNumber)}E${pad(item.IndexNumber)} - ${item.Name}${suffix}.mp4`;
         } else {
             filename = `download${suffix}.mp4`;
         }
+        filename = sanitizeFilename(filename, `download${suffix}.mp4`);
 
-        const durationSeconds = item.RunTimeTicks / 10_000_000;
-        const estimatedBytes = (selectedBitrate * durationSeconds) / 8;
+        const durationSeconds = item.RunTimeTicks ? item.RunTimeTicks / 10_000_000 : 0;
+        const estimatedBytes = durationSeconds > 0 ? (bitrate * durationSeconds) / 8 : 0;
+
+        return {
+            url, query, stopUrl, filename, estimatedBytes, deviceId, playSessionId,
+            videoCodec, audioCodec,
+            codecLabel: `${videoTag} · ${formatBitrate(bitrate)} · ${audioTag}`,
+        };
+    }
+
+    function addToQueue(token, spec, fileHandle) {
+        const parts = buildDownloadParts(spec);
+        // Nothing below this point applies inside the Android app: there is no queue entry, no
+        // progress and no filename of ours once the browser owns the transfer. The handoff goes
+        // through the plugin's Download endpoint so the file lands with its real name instead
+        // of stream.mp4. It carries ?ApiKey= because a browser intent cannot send headers.
+        if (isAndroidAppWebView()) {
+            const handoff = `${spec.baseUrl}/TranscodeDownloader/Download/${spec.itemId}`
+                + `?${parts.query}&filename=${encodeURIComponent(parts.filename)}`
+                + `&ApiKey=${encodeURIComponent(token)}`;
+            handOffToBrowser(handoff, spec.baseUrl, parts.deviceId, parts.playSessionId);
+            return;
+        }
 
         enqueue({
-            id: `${itemId}-${Date.now()}`,
-            filename,
-            estimatedBytes,
-            url,
-            stopUrl,
-            videoCodec,
-            audioCodec,
-            codecLabel: `${videoTag} · ${formatBitrate(selectedBitrate)} · ${audioTag}`,
+            id: `${spec.itemId}-${Date.now()}`,
+            spec,
+            token,
+            fileHandle: fileHandle || null,
+            filename: parts.filename,
+            estimatedBytes: parts.estimatedBytes,
+            url: parts.url,
+            stopUrl: parts.stopUrl,
+            videoCodec: parts.videoCodec,
+            audioCodec: parts.audioCodec,
+            codecLabel: parts.codecLabel,
             receivedBytes: 0,
             abortController: null,
             status: 'waiting',
@@ -1115,6 +1663,7 @@
     injectQueuePanel();
     initStrings();
     flushPendingStops();
+    restoreWaitingQueue();
 
     // Re-fetch strings whenever Jellyfin changes the UI language (updates document.documentElement.lang).
     new MutationObserver(() => {
