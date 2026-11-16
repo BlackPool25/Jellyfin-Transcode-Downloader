@@ -1214,6 +1214,34 @@
         loadingEl.textContent = t('LoadingMediaInfo');
         sheet.appendChild(loadingEl);
 
+        // Drag handle: pull down to dismiss (mobile bottom-sheet behaviour).
+        const grip = document.createElement('div');
+        grip.style.cssText = 'padding:10px 0 4px;cursor:grab;touch-action:none;';
+        const gripBar = document.createElement('div');
+        gripBar.style.cssText = 'width:36px;height:4px;border-radius:2px;background:#666;margin:0 auto;';
+        grip.appendChild(gripBar);
+        sheet.insertBefore(grip, sheet.firstChild);
+        let dragStartY = null;
+        grip.addEventListener('pointerdown', (e) => {
+            dragStartY = e.clientY;
+            try { grip.setPointerCapture(e.pointerId); } catch (_) { /* noop */ }
+            sheet.style.transition = 'none';
+        });
+        grip.addEventListener('pointermove', (e) => {
+            if (dragStartY == null) return;
+            sheet.style.transform = `translateY(${Math.max(0, e.clientY - dragStartY)}px)`;
+        });
+        const endDrag = (e) => {
+            if (dragStartY == null) return;
+            const dy = e.clientY - dragStartY;
+            dragStartY = null;
+            sheet.style.transition = 'transform 0.2s ease-out';
+            if (dy > 120) scrim.remove();
+            else sheet.style.transform = '';
+        };
+        grip.addEventListener('pointerup', endDrag);
+        grip.addEventListener('pointercancel', () => { dragStartY = null; sheet.style.transform = ''; });
+
         scrim.appendChild(sheet);
         document.body.appendChild(scrim);
 
@@ -1244,11 +1272,19 @@
             ? QUALITY_TIERS.filter(tier => tier.bitrate <= currentSource.Bitrate)
             : QUALITY_TIERS;
 
+        // Human-readable track labels. Never leaks "undefined"/"und": prefers the
+        // server's DisplayTitle, then language + codec, then a bare track fallback.
         function trackLabel(s) {
-            const lang = s.Language || s.DisplayLanguage || 'und';
-            const title = s.DisplayTitle || s.Title || s.Codec || '';
             const ch = s.Channels ? ` ${s.Channels}ch` : '';
-            return `${lang} · ${title}${ch}`.trim();
+            if (s.DisplayTitle) return `${s.DisplayTitle}${ch}`;
+            if (s.Title) return `${s.Title}${ch}`;
+            const lang = s.Language || s.DisplayLanguage || '';
+            const hasLang = lang && lang.toLowerCase() !== 'und';
+            const codec = s.Codec || '';
+            if (hasLang && codec) return `${lang} ${codec}${ch}`;
+            if (hasLang) return `${lang}${ch}`;
+            if (codec) return `${codec} track${ch}`;
+            return `Track ${s.Index}${ch}`;
         }
 
         function initTrackDefaults(src) {
@@ -1259,7 +1295,6 @@
             selectedAudioChecked = new Set(defAudio ? [defAudio.Index] : []);
             selectedAudioLanguage = (defAudio && (defAudio.Language || defAudio.DisplayLanguage)) || null;
             if (subs.length === 0) {
-                selectedSubtitleMode = 'none';
                 selectedSubtitleChecked = new Set();
                 selectedSubtitleLanguage = null;
             } else {
@@ -1321,18 +1356,22 @@
             return wrap;
         }
 
-        // Checkbox list (audio / subtitle tracks): multiple choice.
-        function checkList(labelText, noteText, tracks, checked, onToggle) {
+        // Track list: checkboxes for multi-pick, radios when `single` (burn-in takes
+        // exactly one track). Rebuilt on mode toggle so the input type always matches.
+        function checkList(labelText, noteText, tracks, checked, onToggle, single) {
             const wrap = document.createElement('div');
-            const title = document.createElement('div');
-            title.style.cssText = 'font-size:13px;font-weight:600;color:#fff;opacity:0.7;margin-bottom:6px;';
-            title.textContent = labelText;
-            wrap.appendChild(title);
+            if (labelText) {
+                const title = document.createElement('div');
+                title.style.cssText = 'font-size:13px;font-weight:600;color:#fff;opacity:0.7;margin-bottom:6px;';
+                title.textContent = labelText;
+                wrap.appendChild(title);
+            }
             tracks.forEach(s => {
                 const label = document.createElement('label');
                 label.style.cssText = 'display:flex;align-items:center;gap:8px;padding:4px 0;font-size:13px;color:#ddd;cursor:pointer;';
                 const box = document.createElement('input');
-                box.type = 'checkbox';
+                box.type = single ? 'radio' : 'checkbox';
+                if (single) box.name = `qd-sub-${labelText || 'x'}`;
                 box.checked = checked.has(s.Index);
                 box.style.cssText = 'width:16px;height:16px;accent-color:#00a4dc;';
                 box.addEventListener('change', () => onToggle(s.Index, box.checked));
@@ -1397,38 +1436,53 @@
                 }
 
                 if (subs.length > 0) {
-                    const modeWrap = chipRow('Subtitles', [
-                        { id: 'none', label: 'No subtitles' },
-                        { id: 'embed', label: 'Soft subs' },
-                        { id: 'burn', label: 'Burn in' },
-                    ], selectedSubtitleMode, (id) => {
-                        selectedSubtitleMode = id;
-                        if (id === 'none') {
-                            selectedSubtitleChecked = new Set();
-                            selectedSubtitleLanguage = null;
-                        } else if (selectedSubtitleChecked.size === 0) {
-                            selectedSubtitleChecked = new Set([subs[0].Index]);
-                            selectedSubtitleLanguage = subs[0].Language || subs[0].DisplayLanguage || null;
-                        }
+                    // Burn-in is a toggle: ON = exactly one track, burned in (radios);
+                    // OFF = multi-pick, first checked embedded, rest as .srt sidecars.
+                    // No "no subtitles" option — uncheck everything for that.
+                    const burnOn = selectedSubtitleMode === 'burn';
+                    const toggle = document.createElement('button');
+                    toggle.type = 'button';
+                    toggle.setAttribute('aria-pressed', burnOn ? 'true' : 'false');
+                    toggle.style.cssText = 'display:flex;align-items:center;justify-content:space-between;width:100%;'
+                        + 'padding:8px 14px;border-radius:8px;font-size:13px;font-family:inherit;color:#fff;cursor:pointer;'
+                        + `border:1px solid ${burnOn ? '#00a4dc' : '#444'};`
+                        + `background:${burnOn ? 'rgba(0,164,220,0.2)' : 'transparent'};margin-bottom:6px;`;
+                    const toggleLabel = document.createElement('span');
+                    toggleLabel.textContent = 'Burn subtitles into video';
+                    const toggleState = document.createElement('span');
+                    toggleState.style.cssText = `font-weight:700;color:${burnOn ? '#00a4dc' : '#888'};`;
+                    toggleState.textContent = burnOn ? 'ON' : 'OFF';
+                    toggle.appendChild(toggleLabel);
+                    toggle.appendChild(toggleState);
+                    toggle.addEventListener('click', () => {
+                        selectedSubtitleMode = burnOn ? 'embed' : 'burn';
                         render();
+                        refreshTiers();
                     });
-                    section.appendChild(modeWrap);
-                    if (selectedSubtitleMode !== 'none') {
-                        // Burn-in can only ever carry ONE track; the rest ride along as
-                        // sidecars. Embed puts the first checked track in the file.
-                        const note = selectedSubtitleMode === 'burn'
-                            ? 'Burn-in uses the first checked track only; the rest save as .srt sidecars.'
-                            : 'First checked is embedded in the file; the rest save as .srt sidecars.';
-                        section.appendChild(checkList('', note, subs, selectedSubtitleChecked, (idx, on) => {
-                            const next = new Set(selectedSubtitleChecked);
+                    const subHead = document.createElement('div');
+                    subHead.style.cssText = 'font-size:13px;font-weight:600;color:#fff;opacity:0.7;margin:8px 0 6px;';
+                    subHead.textContent = 'Subtitles';
+                    section.appendChild(subHead);
+                    section.appendChild(toggle);
+                    const note = burnOn
+                        ? 'Burn-in takes exactly one track — pick it below.'
+                        : 'First checked is embedded in the file; the rest save as .srt sidecars. Uncheck all for no subtitles.';
+                    section.appendChild(checkList('', note, subs, selectedSubtitleChecked, (idx, on) => {
+                        let next;
+                        if (burnOn) {
+                            // Radio behaviour: exactly one.
+                            next = on ? new Set([idx]) : new Set();
+                        } else {
+                            next = new Set(selectedSubtitleChecked);
                             if (on) next.add(idx);
                             else next.delete(idx);
-                            selectedSubtitleChecked = next;
-                            const primary = primaryChecked(subs, next);
-                            selectedSubtitleLanguage = primary
-                                ? (primary.Language || primary.DisplayLanguage || null) : null;
-                        }));
-                    }
+                        }
+                        selectedSubtitleChecked = next;
+                        const primary = primaryChecked(subs, next);
+                        selectedSubtitleLanguage = primary
+                            ? (primary.Language || primary.DisplayLanguage || null) : null;
+                        if (burnOn) render();
+                    }, burnOn));
                 }
             };
             render();
@@ -1492,57 +1546,22 @@
                 if (scaleBitrate(t.bitrate, factor) <= cap) recIdx = i;
             });
 
+            let pendingTier = null; // QUALITY_TIERS object; scaled at download time
+            let tierTouched = false;
             for (const [ti, tier] of tiers.entries()) {
                 const bitrate = scaleBitrate(tier.bitrate, factor);
                 const sizeHint = durationSeconds > 0 ? ` · ${formatSize(bitrate * durationSeconds / 8)}` : '';
                 const star = ti === recIdx ? '★ ' : '';
-                const btn = makeMenuItem('video_settings', `${star}${tier.resolution} · ${formatBitrate(bitrate)}${sizeHint}`, () => {
-                    scrim.remove();
-                    if (batchOpt && batchOpt.episodes) {
-                        // Whole-selection batch: review per-episode track resolution first,
-                        // then one folder picker and Series/Season NN/ output.
-                        startBatchReview(batchOpt.episodes, batchOpt.seriesTitle || '',
-                            tier, bitrate, videoCodec, audioCodec);
-                    } else if (batchSeason) {
-                        getApiClient(0, 5, async (client) => {
-                            const token = client.accessToken();
-                            const baseUrl = client.serverAddress() || window.location.origin;
-                            let eps = [];
-                            try {
-                                const res = await client.getItems(client.getCurrentUserId(), {
-                                    ParentId: item.SeasonId,
-                                    IncludeItemTypes: 'Episode',
-                                    Fields: 'MediaSources,ParentIndexNumber,IndexNumber,Name,SeriesName,RunTimeTicks,ProductionYear,Type',
-                                    SortBy: 'ParentIndexNumber,IndexNumber',
-                                    SortOrder: 'Ascending',
-                                    Recursive: true,
-                                });
-                                eps = (res && res.Items) || [];
-                            } catch (err) {
-                                console.error('[TranscodeDownloader] season fetch failed:', err);
-                                showTransientNotice(t('DownloadFailed'));
-                                return;
-                            }
-                            if (eps.length === 0) {
-                                showTransientNotice(t('NoTranscodeOptions'));
-                                return;
-                            }
-                            startBatchReview(eps, item.SeriesName || '', tier, bitrate, videoCodec, audioCodec);
-                        });
-                    } else {
-                        const tracks = resolveEpisodeTracks(item, currentSource,
-                            selectedAudioChecked, selectedSubtitleChecked, selectedSubtitleMode);
-                        const streams = (currentSource && currentSource.MediaStreams) || [];
-                        const audios = streams.filter(s => s.Type === 'Audio');
-                        const subs = streams.filter(s => s.Type === 'Subtitle');
-                        const extraAudios = audios.filter(a =>
-                            selectedAudioChecked.has(a.Index) && a.Index !== tracks.audioStreamIndex);
-                        const extraSubs = selectedSubtitleMode === 'none' ? [] : subs.filter(s =>
-                            selectedSubtitleChecked.has(s.Index) && s.Index !== tracks.subtitleStreamIndex);
-                        onTranscodeMenuClick(tier, bitrate, item.Id || itemId, item, tracks,
-                            { audios: extraAudios, subs: extraSubs });
-                    }
+                if (!tierTouched && !pendingTier && ti === recIdx) pendingTier = tier;
+                const selected = pendingTier === tier;
+                const btn = makeMenuItem('video_settings',
+                    `${selected ? '● ' : ''}${star}${tier.resolution} · ${formatBitrate(bitrate)}${sizeHint}`, () => {
+                    pendingTier = tier;
+                    tierTouched = true;
+                    renderTiers();
+                    refreshSummary();
                 });
+                if (selected) btn.style.border = '1px solid #00a4dc';
                 tierList.appendChild(btn);
             }
 
@@ -1570,6 +1589,87 @@
                 appleWarn.textContent = t('AppleCodecWarning')
                     + (mkvWarn ? ' MKV needs VLC or Infuse on Apple devices.' : '');
             }
+            refreshSummary();
+        };
+
+        const summaryEl = document.createElement('div');
+        summaryEl.style.cssText = 'padding:8px 20px;font-size:13px;color:#ddd;min-height:20px;';
+        const dlBtn = document.createElement('button');
+        dlBtn.type = 'button';
+        dlBtn.style.cssText = 'margin:4px 20px 8px;width:calc(100% - 40px);padding:12px;border-radius:8px;'
+            + 'font-size:15px;font-weight:700;font-family:inherit;color:#fff;cursor:pointer;'
+            + 'border:1px solid #00a4dc;background:rgba(0,164,220,0.35);';
+        dlBtn.addEventListener('click', () => doDownload());
+
+        const refreshSummary = () => {
+            const count = batchOpt && batchOpt.episodes ? batchOpt.episodes.length : 0;
+            dlBtn.textContent = batchOpt ? `Download ${count} episode${count === 1 ? '' : 's'}`
+                : batchSeason ? 'Download season'
+                : 'Download';
+            if (!pendingTier) {
+                summaryEl.textContent = 'Pick a quality above.';
+                dlBtn.style.opacity = '0.5';
+                return;
+            }
+            dlBtn.style.opacity = '';
+            const bitrate = scaleBitrate(pendingTier.bitrate, videoCodecFactor(selectedVideoCodec));
+            const size = durationSeconds > 0 ? formatSize(bitrate * durationSeconds / 8) : 'unknown size';
+            let where;
+            if (isAndroidAppWebView()) where = 'Opens in your browser to save.';
+            else if (batchOpt || batchSeason) where = 'Saves into a folder you pick (Series/Season NN/).';
+            else if (typeof window.showSaveFilePicker === 'function') where = 'Saves via file picker.';
+            else where = 'Saves via automatic download.';
+            summaryEl.textContent =
+                `${pendingTier.resolution} · ${formatBitrate(bitrate)} · ${size} · ${where}`;
+        };
+
+        const doDownload = () => {
+            if (!pendingTier) return;
+            const tier = pendingTier;
+            const bitrate = scaleBitrate(tier.bitrate, videoCodecFactor(selectedVideoCodec));
+            scrim.remove();
+            if (batchOpt && batchOpt.episodes) {
+                startBatchReview(batchOpt.episodes, batchOpt.seriesTitle || '',
+                    tier, bitrate, videoCodec, audioCodec);
+            } else if (batchSeason) {
+                getApiClient(0, 5, async (client) => {
+                    const token = client.accessToken();
+                    const baseUrl = client.serverAddress() || window.location.origin;
+                    let eps = [];
+                    try {
+                        const res = await client.getItems(client.getCurrentUserId(), {
+                            ParentId: item.SeasonId,
+                            IncludeItemTypes: 'Episode',
+                            Fields: 'MediaSources,ParentIndexNumber,IndexNumber,Name,SeriesName,RunTimeTicks,ProductionYear,Type',
+                            SortBy: 'ParentIndexNumber,IndexNumber',
+                            SortOrder: 'Ascending',
+                            Recursive: true,
+                        });
+                        eps = (res && res.Items) || [];
+                    } catch (err) {
+                        console.error('[TranscodeDownloader] season fetch failed:', err);
+                        showTransientNotice(t('DownloadFailed'));
+                        return;
+                    }
+                    if (eps.length === 0) {
+                        showTransientNotice(t('NoTranscodeOptions'));
+                        return;
+                    }
+                    startBatchReview(eps, item.SeriesName || '', tier, bitrate, videoCodec, audioCodec);
+                });
+            } else {
+                const tracks = resolveEpisodeTracks(item, currentSource,
+                    selectedAudioChecked, selectedSubtitleChecked, selectedSubtitleMode);
+                const streams = (currentSource && currentSource.MediaStreams) || [];
+                const audios = streams.filter(s => s.Type === 'Audio');
+                const subs = streams.filter(s => s.Type === 'Subtitle');
+                const extraAudios = audios.filter(a =>
+                    selectedAudioChecked.has(a.Index) && a.Index !== tracks.audioStreamIndex);
+                const extraSubs = subs.filter(s =>
+                    selectedSubtitleChecked.has(s.Index) && s.Index !== tracks.subtitleStreamIndex);
+                onTranscodeMenuClick(tier, bitrate, item.Id || itemId, item, tracks,
+                    { audios: extraAudios, subs: extraSubs });
+            }
         };
 
         // Only offered when the server told us what it can encode; otherwise the flow stays
@@ -1588,21 +1688,24 @@
             sheet.appendChild(handoffHint);
         }
 
-        // Season batch: arm with this button, then tap any tier to enqueue every episode
-        // at that tier/codec with the same track languages. Batch rows use in-memory
-        // downloads (no save picker can open for 12 files from one tap).
+        // Season batch: arm with this button, pick a quality, then Download —
+        // every episode queues at that tier/codec with the same track languages.
         let batchSeason = false;
         if (item.Type === 'Episode' && item.SeasonId && !isAndroidAppWebView() && !batchOpt) {
             const batchBtn = makeMenuItem('video_library', 'Queue season…', () => {
                 batchSeason = true;
                 batchBtn.style.opacity = '0.5';
-                showTransientNotice('Season batch armed — tap a quality to queue every episode.');
+                refreshSummary();
+                showTransientNotice('Season batch armed — pick a quality, then Download.');
             });
             sheet.appendChild(batchBtn);
         }
 
         refreshTiers();
         sheet.appendChild(tierList);
+        sheet.appendChild(summaryEl);
+        sheet.appendChild(dlBtn);
+        refreshSummary();
     }
 
     // Batch enqueue with proper folders: each episode lands in
@@ -1627,6 +1730,11 @@
             if (sources.length === 0) continue;
             const src = sources[0];
             const tracks = resolveEpisodeTracks(ep, src);
+            // An emptied checklist means NO subtitles — even in burn mode.
+            if (selectedSubtitleChecked.size === 0) {
+                tracks.subtitleStreamIndex = null;
+                tracks.subtitleMethod = null;
+            }
             const spec = {
                 baseUrl, itemId: ep.Id, tier, bitrate, item: ep, videoCodec, audioCodec,
                 container: selectedContainer,
@@ -1710,7 +1818,7 @@
                 const s = sources[0].MediaStreams.find(x => x.Index === tracks.subtitleStreamIndex);
                 subLang = s ? ((s.Language || s.DisplayLanguage) || 'und') : null;
             }
-            const wantSub = selectedSubtitleMode !== 'none';
+            const wantSub = selectedSubtitleChecked.size > 0;
             const audioMismatch = !!selectedAudioLanguage
                 && !!audioLang
                 && audioLang.toLowerCase() !== selectedAudioLanguage.toLowerCase();
@@ -1973,7 +2081,7 @@
     // Current sheet's track choices. Reset on every sheet open; the click handler copies
     // them into the entry spec so retries, restores and season batches reuse them.
     let selectedMediaSourceId = null;
-    let selectedSubtitleMode = 'burn'; // 'burn' | 'embed' | 'none'
+    let selectedSubtitleMode = 'burn'; // 'burn' | 'embed'. No-subtitles = empty checklist.
     // Checklists hold stream Index values; the first checked track (in track order)
     // is the primary that goes into the transcode. The rest become sidecars
     // (subtitles) or extra full downloads (audio).
@@ -2045,7 +2153,7 @@
         }
         let subtitleStreamIndex = null;
         let subtitleMethod = null;
-        if (subMode !== 'none' && subs.length > 0 && !(subChecked && subChecked.size === 0)) {
+        if (subs.length > 0 && !(subChecked && subChecked.size === 0)) {
             const t = subChecked
                 ? primaryChecked(subs, subChecked)
                 : null;
