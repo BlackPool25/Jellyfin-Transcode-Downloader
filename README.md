@@ -2,7 +2,6 @@
 
 [![Latest release](https://img.shields.io/github/v/release/BlackPool25/Jellyfin-Transcode-Downloader?label=release)](https://github.com/BlackPool25/Jellyfin-Transcode-Downloader/releases)
 [![Jellyfin](https://img.shields.io/badge/Jellyfin-12.4%2B-00a4dc)](https://jellyfin.org)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 A Jellyfin **server plugin** that adds a **"Download (Transcode…)"** entry to the ⋯ menu on
 every movie and episode. Pick a codec, quality, audio and subtitle setup — Jellyfin transcodes
@@ -159,11 +158,20 @@ browser profiles. Both fail on any `ReferenceError`.
   DLL + `logo.png` as `jellyfin-transcode-downloader_X.Y.Z.zip`, prepend the entry to
   `repo/manifest.json` (`targetAbi` = Jellyfin line, e.g. `12.4.0.0`).
 
+## License status — read before reusing
+
+The upstream project has **no license** (no LICENSE file, no declaration anywhere —
+GitHub reports `license: null`), so by default it is all rights reserved. That means
+**this fork is not MIT/GPL/Apache licensed either** — see [NOTICE](NOTICE). The changes
+made here are the fork author's own work, but only the upstream author can license the
+combined codebase. A license request will be opened upstream; until it lands, treat this code
+as personal-use only. Do not copy it into your own projects yet.
+
 ## Credits
 
 Upstream project by [ph15ch](https://github.com/ph15ch/Jellyfin-Transcode-Downloader) and
 contributors — the menu injection, transcode flow and queue design originate there. This
 fork ports it to Jellyfin 12, adds the phone-first UI, tracks/subtitles handling, batch
 folders, saved locations and mobile support. Jellyfin itself is
-[GPL-licensed](https://github.com/jellyfin/jellyfin); this plugin is MIT (see LICENSE —
-change it if you prefer another license).
+[GPL-licensed](https://github.com/jellyfin/jellyfin); this plugin carries no license of its
+own yet — see [License status](#license-status--read-before-reusing) above.
