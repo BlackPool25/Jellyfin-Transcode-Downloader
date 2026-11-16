@@ -294,6 +294,85 @@
         });
     }
 
+    // Persistent download folder: a directory handle picked once via
+    // showDirectoryPicker, stored in IndexedDB, reused across sessions.
+    // (File handles can't persist, but directory handles can — with a
+    // permission re-grant that happens on the Download click gesture.)
+    const QD_DB = 'transcodeDownloader';
+    const QD_STORE = 'handles';
+
+    function qdIdb() {
+        return new Promise((resolve, reject) => {
+            try {
+                const req = indexedDB.open(QD_DB, 1);
+                req.onupgradeneeded = () => req.result.createObjectStore(QD_STORE);
+                req.onsuccess = () => resolve(req.result);
+                req.onerror = () => reject(req.error);
+            } catch (e) { reject(e); }
+        });
+    }
+
+    async function qdIdbGet(key) {
+        const db = await qdIdb();
+        return new Promise((resolve) => {
+            try {
+                const tx = db.transaction(QD_STORE, 'readonly');
+                const req = tx.objectStore(QD_STORE).get(key);
+                req.onsuccess = () => resolve(req.result || null);
+                req.onerror = () => resolve(null);
+            } catch (_) { resolve(null); }
+        });
+    }
+
+    async function qdIdbSet(key, value) {
+        const db = await qdIdb();
+        return new Promise((resolve) => {
+            try {
+                const tx = db.transaction(QD_STORE, 'readwrite');
+                tx.objectStore(QD_STORE).put(value, key);
+                tx.oncomplete = () => resolve(true);
+                tx.onerror = () => resolve(false);
+            } catch (_) { resolve(false); }
+        });
+    }
+
+    async function qdIdbDel(key) {
+        const db = await qdIdb();
+        return new Promise((resolve) => {
+            try {
+                const tx = db.transaction(QD_STORE, 'readwrite');
+                tx.objectStore(QD_STORE).delete(key);
+                tx.oncomplete = () => resolve(true);
+                tx.onerror = () => resolve(false);
+            } catch (_) { resolve(false); }
+        });
+    }
+
+    let savedDirHandle = null;
+    let savedDirName = '';
+
+    async function loadSavedDir() {
+        savedDirHandle = null;
+        savedDirName = '';
+        if (typeof window.showDirectoryPicker !== 'function') return;
+        try {
+            const rec = await qdIdbGet('root');
+            if (rec && rec.handle && rec.name) {
+                savedDirHandle = rec.handle;
+                savedDirName = rec.name;
+            }
+        } catch (_) { /* IndexedDB unavailable — no saved folder */ }
+    }
+
+    async function ensureDirPermission(handle) {
+        try {
+            const opts = { mode: 'readwrite' };
+            if (await handle.queryPermission(opts) === 'granted') return true;
+            return await handle.requestPermission(opts) === 'granted';
+        } catch (_) {
+            return false;
+        }
+    }
     // --- Download queue ---
     // Each entry: { id, filename, estimatedBytes, url, stopUrl, abortController, status: 'waiting'|'active' }
     const downloadQueue = [];
@@ -1599,6 +1678,63 @@
         }
         sheet.appendChild(buildTrackSection());
 
+        // Save location: a folder picked once, remembered in IndexedDB, used for
+        // every download until changed. Chromium-only; elsewhere the row hides and
+        // the browser default applies.
+        const saveRow = document.createElement('div');
+        saveRow.style.margin = '4px 0 0';
+        sheet.appendChild(saveRow);
+        const renderSaveRow = () => {
+            saveRow.textContent = '';
+            if (typeof window.showDirectoryPicker !== 'function') return;
+            const title = document.createElement('div');
+            title.className = 'qd-section-title';
+            title.textContent = 'Save to';
+            saveRow.appendChild(title);
+            const row = document.createElement('div');
+            row.style.cssText = 'display:flex;align-items:center;gap:8px;flex-wrap:wrap;';
+            const where = document.createElement('div');
+            where.style.cssText = 'font-size:14px;color:#f2f2f5;flex:1;min-width:140px;';
+            where.textContent = savedDirName ? `📁 ${savedDirName}` : 'Ask every time';
+            row.appendChild(where);
+            const change = document.createElement('button');
+            change.type = 'button';
+            change.className = 'qd-chip';
+            change.textContent = savedDirName ? 'Change…' : 'Choose folder…';
+            change.addEventListener('click', async () => {
+                let dir = null;
+                try { dir = await window.showDirectoryPicker(); }
+                catch (e) { return; /* cancelled */ }
+                if (dir) {
+                    savedDirHandle = dir;
+                    savedDirName = dir.name || 'chosen folder';
+                    try { await qdIdbSet('root', { handle: dir, name: savedDirName }); } catch (_) { /* noop */ }
+                    renderSaveRow();
+                    refreshSummary();
+                }
+            });
+            row.appendChild(change);
+            if (savedDirName) {
+                const forget = document.createElement('button');
+                forget.type = 'button';
+                forget.className = 'qd-linkbtn';
+                forget.style.width = 'auto';
+                forget.style.padding = '8px';
+                forget.textContent = 'Forget';
+                forget.addEventListener('click', async () => {
+                    try { await qdIdbDel('root'); } catch (_) { /* noop */ }
+                    savedDirHandle = null;
+                    savedDirName = '';
+                    renderSaveRow();
+                    refreshSummary();
+                });
+                row.appendChild(forget);
+            }
+            saveRow.appendChild(row);
+        };
+        renderSaveRow();
+        loadSavedDir().then(() => { renderSaveRow(); refreshSummary(); });
+
         const durationSeconds = item.RunTimeTicks ? item.RunTimeTicks / 10_000_000 : 0;
 
         const infoEl = document.createElement('div');
@@ -1738,6 +1874,7 @@
             const size = durationSeconds > 0 ? formatSize(bitrate * durationSeconds / 8) : 'unknown size';
             let where;
             if (isAndroidAppWebView()) where = 'Opens in your browser to save.';
+            else if (savedDirHandle && savedDirName) where = `Saves into 📁 ${savedDirName}${(batchOpt || batchSeason) ? ' (Series/Season NN/ inside it)' : ''}.`;
             else if (batchOpt || batchSeason) where = 'Saves into a folder you pick (Series/Season NN/).';
             else if (typeof window.showSaveFilePicker === 'function') where = 'Saves via file picker.';
             else where = 'Saves via automatic download.';
@@ -1964,8 +2101,14 @@
         getApiClient(0, 5, async (client) => {
             const token = client.accessToken();
             const baseUrl = client.serverAddress() || window.location.origin;
-            const dirHandle = await pickBatchDirectory();
-            if (!dirHandle) return;
+            // Saved folder wins here too: no picker, straight into Series/Season NN/.
+            let dirHandle = null;
+            if (savedDirHandle && await ensureDirPermission(savedDirHandle)) {
+                dirHandle = savedDirHandle;
+            } else {
+                dirHandle = await pickBatchDirectory();
+                if (!dirHandle) return;
+            }
             const firstSrc = (episodes[0] && episodes[0].MediaSources && episodes[0].MediaSources[0]) || null;
             const firstSubs = firstSrc ? (firstSrc.MediaStreams || []).filter(s => s.Type === 'Subtitle') : [];
             const langs = extraSubtitleLangs(firstSubs, selectedSubtitleLanguage);
@@ -2368,10 +2511,18 @@
             const token = client.accessToken();
             const baseUrl = client.serverAddress() || window.location.origin;
             spec.baseUrl = baseUrl;
-            const suggestedName = buildDownloadParts(spec).filename;
-            const fileHandle = await pickSaveFile(suggestedName, spec.container);
-            if (fileHandle === 'cancelled') return;
-            addToQueue(token, spec, fileHandle);
+            // Saved folder wins: everything lands there with no picker.
+            // Otherwise fall back to the one-time save dialog.
+            let fileHandle = null;
+            let dirHandle = null;
+            if (savedDirHandle && await ensureDirPermission(savedDirHandle)) {
+                dirHandle = savedDirHandle;
+            } else {
+                const suggestedName = buildDownloadParts(spec).filename;
+                fileHandle = await pickSaveFile(suggestedName, spec.container);
+                if (fileHandle === 'cancelled') return;
+            }
+            addToQueue(token, spec, fileHandle, dirHandle);
             queueExtraTracks(token, spec, extras);
         });
     }
@@ -2432,7 +2583,7 @@
         };
     }
 
-    function addToQueue(token, spec, fileHandle) {
+    function addToQueue(token, spec, fileHandle, dirHandle) {
         const parts = buildDownloadParts(spec);
         // Nothing below this point applies inside the Android app: there is no queue entry, no
         // progress and no filename of ours once the browser owns the transfer. The handoff goes
@@ -2452,6 +2603,8 @@
             spec,
             token,
             fileHandle: fileHandle || null,
+            dirHandle: dirHandle || null,
+            dirPath: [],
             filename: parts.filename,
             estimatedBytes: parts.estimatedBytes,
             url: parts.url,
