@@ -231,7 +231,7 @@
         BrowserHandoffHint: 'The Jellyfin Android app cannot save downloads itself, so this opens in your browser with the real filename.',
         BrowserHandoffStarted: 'Handed to your browser — check its downloads.',
         BrowserHandoffFailed: 'Could not open your browser.',
-        AppleCodecWarning: 'Heads up: Apple players cannot play HEVC videos tagged hev1, and ignore Opus audio in MP4. Pick H.264 + AAC for iPhone/iPad.',
+        AppleCodecWarning: 'Apple players cannot play HEVC videos tagged hev1, and ignore Opus audio in MP4. Pick H.264 + AAC for iPhone/iPad.',
         RetryDownload: 'Retry',
     };
 
@@ -536,6 +536,12 @@
         }
         try { window.localStorage.removeItem(STORAGE_QUEUE); } catch (_) { /* noop */ }
         renderQueue();
+        // Say so: silent auto-starts after a reload surprise people (and restored
+        // rows fall back to in-memory downloads since file handles can't persist).
+        if (downloadQueue.length > 0) {
+            showTransientNotice(
+                `Restored ${downloadQueue.length} queued download${downloadQueue.length === 1 ? '' : 's'} from last visit — restarting from zero.`);
+        }
         // Restored rows would otherwise sit idle forever — nothing else kicks the pump.
         if (downloadQueue.length > 0 && !queueProcessing) processQueue();
     }
@@ -1890,11 +1896,9 @@
             const showWarn = risky || selectedContainer === 'mkv';
             appleWarn.style.display = showWarn ? '' : 'none';
             if (showWarn) {
-                appleWarn.textContent = isApplePlayer()
-                    ? t('AppleCodecWarning')
-                        + (selectedContainer === 'mkv' ? ' MKV needs VLC or Infuse on Apple devices.' : '')
-                    : 'Heads up if this file is for an iPhone/iPad/Apple TV: ' + t('AppleCodecWarning')
-                        + (selectedContainer === 'mkv' ? ' MKV needs VLC or Infuse on Apple devices.' : '');
+                const base = t('AppleCodecWarning');
+                appleWarn.textContent = isApplePlayer() ? `Heads up: ${base}` : `If this file is for Apple devices, note: ${base}`
+                    + (selectedContainer === 'mkv' ? ' MKV needs VLC or Infuse on Apple devices.' : '');
             }
             refreshSummary();
         };
@@ -1935,6 +1939,7 @@
             const size = durationSeconds > 0 ? formatSize(bitrate * durationSeconds / 8) : 'unknown size';
             let where;
             if (isAndroidAppWebView()) where = 'Opens in your browser to save.';
+            else if (!savedDirHandle && typeof window.showSaveFilePicker !== 'function' && isMobileBrowser()) where = 'Downloads via browser \u2014 check notifications.';
             else if (savedDirHandle && savedDirName) where = `Saves into 📁 ${savedDirName}${(batchOpt || batchSeason) ? ' (Series/Season NN/ inside it)' : ''}.`;
             else if (batchOpt || batchSeason) where = 'Saves into a folder you pick (Series/Season NN/).';
             else if (typeof window.showSaveFilePicker === 'function') where = 'Saves via file picker.';
@@ -2602,6 +2607,26 @@
         }
     }
 
+    // Mobile browsers (Android Chrome, iOS anything): no File System Access, and
+    // blob: downloads don't work on Android Chrome — so hand the transcode URL to
+    // the browser itself, exactly like the Android-app handoff. The Download
+    // endpoint serves it with a real filename, and the OS download manager owns it.
+    function isMobileBrowser() {
+        if (isAndroidAppWebView()) return false;
+        return /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent || '');
+    }
+
+    function navigateToDownload(url, filename) {
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = filename || '';
+        a.rel = 'noopener';
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        showTransientNotice('Download started — check your notifications.');
+    }
+
     function onTranscodeMenuClick(tier, bitrate, itemId, item, tracks, extras) {
         if (!item) return;
         // Captured now: the sheet is gone, but the selection must not drift before the
@@ -2620,6 +2645,17 @@
             const token = client.accessToken();
             const baseUrl = client.serverAddress() || window.location.origin;
             spec.baseUrl = baseUrl;
+            // Mobile browsers without a save picker can't take blobs or directories:
+            // hand the transcode URL to the browser itself (OS download manager).
+            if (!savedDirHandle && isMobileBrowser() && typeof window.showSaveFilePicker !== 'function') {
+                const parts = buildDownloadParts(spec);
+                const url = `${baseUrl}/TranscodeDownloader/Download/${spec.itemId}`
+                    + `?${parts.query}&filename=${encodeURIComponent(parts.filename)}`
+                    + `&container=${parts.container}&ApiKey=${encodeURIComponent(token)}`;
+                navigateToDownload(url, parts.filename);
+                queueExtraTracks(token, spec, extras);
+                return;
+            }
             // Saved folder wins: everything lands there with no picker.
             // Otherwise fall back to the one-time save dialog.
             let fileHandle = null;

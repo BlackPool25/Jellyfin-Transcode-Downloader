@@ -1,0 +1,13 @@
+{
+  "name": "transcode-downloader-tests",
+  "private": true,
+  "version": "1.0.0",
+  "scripts": {
+    "smoke": "node smoke.js",
+    "matrix": "node clients-matrix.js",
+    "test": "npm run smoke && npm run matrix"
+  },
+  "devDependencies": {
+    "jsdom": "^31.0.1"
+  }
+}

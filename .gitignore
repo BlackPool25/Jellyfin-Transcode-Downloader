@@ -3,3 +3,7 @@ src/obj/
 *.user
 demo/__pycache__/
 publish/
+
+jellyfin-transcode-downloader_*.zip
+publish/
+node_modules/

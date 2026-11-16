@@ -1,220 +1,169 @@
-# Jellyfin Transcode Downloader
+# Transcode Downloader for Jellyfin
 
-![Transcode Downloader](logo.png)
-![GitHub Downloads (all assets, all releases)](https://img.shields.io/github/downloads/ph15ch/Jellyfin-Transcode-Downloader/total)
+[![Latest release](https://img.shields.io/github/v/release/BlackPool25/Jellyfin-Transcode-Downloader?label=release)](https://github.com/BlackPool25/Jellyfin-Transcode-Downloader/releases)
+[![Jellyfin](https://img.shields.io/badge/Jellyfin-12.4%2B-00a4dc)](https://jellyfin.org)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-A Jellyfin **server plugin** that adds a quality-selection transcoded download option to the
-More menu on item detail pages. Pick a video codec, an audio codec and a quality tier, and
-Jellyfin transcodes the file on the fly. Use Jellyfin's built-in Download button to grab the
-original file.
-## My other projects
-- [PackShare](https://packshare.de) is a tool to plan your festival with your friends. One source of truth: what do we need, who buys it and who brings it. Includes a planning, buying and packing tool.
-- [Easy Intervals MCP](https://easy-intervals.de) is a MCP Server for www.intervals.icu. This helps you to connect your favorite LLM to your health, fitness and trainings data. 
+A Jellyfin **server plugin** that adds a **"Download (Transcode…)"** entry to the ⋯ menu on
+every movie and episode. Pick a codec, quality, audio and subtitle setup — Jellyfin transcodes
+on the fly (hardware-accelerated where available) and the file downloads with a live progress
+bar and a proper filename like `Dune (2021) [HEVC 4Mbps AAC].mp4`.
 
-## How to download
+Forked from [ph15ch/Jellyfin-Transcode-Downloader](https://github.com/ph15ch/Jellyfin-Transcode-Downloader)
+and brought up to Jellyfin 12.x with a rebuilt phone-first UI.
 
-![Demo](demo/jellyfin-demo.gif)
+![Quality sheet — codecs and tracks](docs/images/sheet-top.png)
 
-After installing the plugin, open any **movie or episode detail page** in the Jellyfin web
-client. Open the **"More" menu** (the `⋯` / kebab menu on the detail page) — a
-**"Download (Transcode…)"** entry appears at the bottom of the list. The entry also shows up
-in the `⋯` menu of any episode row or card, so an episode can be downloaded straight from a
-season or series page without opening it first.
+## Features
 
-Selecting it opens a quality picker. Choose a video codec, an audio codec and a bitrate tier —
-Jellyfin transcodes on the fly and the plugin downloads the stream with a live progress bar.
-To grab the original file without transcoding, use Jellyfin's own **Download** button that's
-already in the More menu.
+**Downloads, your way**
+- **Transcoded downloads with a quality picker** — H.264 / HEVC / AV1 video, AAC / Opus
+  audio, per-codec bitrate tiers, all hardware-accelerated when your server supports it.
+- **Original-file downloads** — a dedicated `Original file` row skips the transcode entirely
+  when the source already fits (no re-encode, no wait, all tracks included). The picker even
+  tells you when a transcode tier would be pointless.
+- **Smart defaults** — the ★ rung is auto-picked (best quality at or under ~4 Mbps), and the
+  codec defaults to HEVC where your server and device support it (never auto-picked on Apple
+  devices; AV1 is offered but never default).
+- **MP4 or MKV output** — MKV keeps styled subtitles and chapters.
 
-You can queue multiple items: navigate to another movie or episode and add more downloads
-while one is already in progress. Each queued item waits its turn and starts automatically
-when the one ahead of it finishes.
+**Audio & subtitles, done right**
+- **Multi-select audio tracks** — first checked track goes in the file; extra tracks queue
+  as their own full downloads, each clearly labeled.
+- **Subtitle modes** — burn-in toggle (exactly one track, the only faithful path for styled
+  ASS / image PGS subs) or soft subs with multi-pick (first embedded, the rest download as
+  `.srt` sidecars). Uncheck everything for no subtitles.
+- **Per-episode resolution in batches** — every episode's tracks are resolved individually.
+  A **pre-download review** groups mismatches by season
+  (`E7 audio → default, no subs`) with **Download all** or **Skip flagged**.
+- HDR sources trigger a tone-mapping note; Apple devices get HEVC/Opus/MKV warnings only
+  when relevant.
 
-### Choosing a codec
+**Batch & library-friendly**
+- **Whole seasons and series** — ⋯ menus on seasons/series open a season checklist with
+  episode counts, then one quality sheet fans out to everything.
+- **Real folder output** — batches land in `Series/Season NN/` subfolders, filenames matching
+  your library convention (`Show (2017) - S01E01 [H264 4Mbps AAC].mp4`).
+- **Saved download folder** — pick a folder once (remembered across sessions); every single
+  and batch download goes there automatically. Change or forget it anytime.
+- **Resilient queue** — serial downloads with live progress, per-item cancel, failed rows
+  stay with the reason and a **Retry** button, and waiting items survive a browser restart.
 
-The picker offers **H.264 (AVC)**, **HEVC (H.265)** and **AV1** for video, and **AAC** or
-**Opus** for audio. H.264/AAC is the default and plays everywhere. Your last choice is
-remembered in the browser, so you only pick it once.
+![Quality sheet — tiers and download](docs/images/sheet-tiers.png)
+![Quality sheet on mobile](docs/images/sheet-mobile.png)
 
-The bitrate tiers are **codec-relative**: they are calibrated for H.264, and HEVC (≈ 65%) and
-AV1 (≈ 50%) targets are scaled down so a given rung means roughly the same picture quality on
-every codec. Picking "1080p" on AV1 therefore produces a smaller file than on H.264, not a
-worse-looking one.
+## Install (2 minutes)
 
-A codec is shown greyed out, with the reason spelled out underneath, when:
+**Option A — plugin catalog (recommended, auto-updates on restart):**
 
-- **it isn't supported by this server's FFmpeg** — Jellyfin resolves e.g. AV1 to `libsvtav1`,
-  but not every FFmpeg build includes it. The plugin asks the server which encoders actually
-  exist rather than letting the download start and die halfway through.
-- **it's disabled by the server administrator** — HEVC and AV1 encoding are governed by
-  **Dashboard → Playback → "Allow encoding in HEVC format" / "Allow encoding in AV1 format"**,
-  and **both are off by default**. An administrator has to turn them on before those codecs
-  become selectable here.
-
-If a codec resolves to a **software encoder** (`libx265`, `libsvtav1`), the picker says so. A
-software AV1 transcode of a long 4K film can run for hours, and the download is held in the
-browser's memory until it finishes.
-
-Two playback caveats worth knowing before picking something exotic:
-
-- **HEVC in MP4** is written by Jellyfin with the `hev1` tag rather than `hvc1`. VLC, mpv and
-  ffmpeg play it fine; Apple QuickTime and Safari generally will not.
-- **Opus in MP4** is likewise well supported by VLC, mpv, Chrome and Firefox, but not by
-  Apple's players. Pick AAC if the file has to play on an Apple device.
-
-### What happens in the background
-
-Jellyfin encodes the video server-side to the selected codec and bitrate and streams the
-result. The plugin downloads the stream chunk by chunk, shows a live progress bar with an
-estimated file size, and saves it as an `.mp4` once complete. The chosen codecs and bitrate
-are recorded in the filename, e.g. `Movie (2020) [AV1 4Mbps AAC].mp4`, so files downloaded at
-different settings don't collide.
-
-The estimated file size shown during a transcoded download is calculated from the selected
-bitrate and the item's runtime (`~size = bitrate × duration ÷ 8`). It carries a `~`
-prefix because VBR encoding means the real size can vary by ±10–15%.
-
-### Download queue
-
-A panel in the bottom-right corner shows all queued downloads, each labelled with its codecs
-and bitrate. The active item displays a progress bar; items waiting to start show "Waiting…".
-Each item has its own **✕** cancel button — cancelling removes only that item and the next one
-starts automatically. The panel disappears when the queue is empty.
-
-Waiting entries survive a reload: their specs are kept in `localStorage` and resume
-(processing restarts automatically, from zero — bytes already received are lost, and
-restored rows fall back to in-memory download since file handles can't persist).
-
-Cancelling mid-download aborts the in-progress request cleanly; no partial file is saved.
-
-### In the Jellyfin Android app
-
-The Android app runs the Jellyfin web client inside a WebView that **cannot save downloads
-started by the page** — it registers no download handler at all, so a download simply
-disappears with no file and no error. (The app's own Download button sidesteps this: it hands
-the item to the app's native downloader, which only knows how to fetch original files.)
-
-The plugin detects the app and hands the download to your **system browser** instead, which
-saves it normally. The quality and codec picker works exactly as it does elsewhere; what
-changes after you pick a tier:
-
-- there is **no progress bar, queue or cancel button** — the transfer belongs to the browser,
-  so track it in the browser's own downloads list;
-- the file arrives **with its real name** (`Movie (2020) [H264 4Mbps AAC].mp4`), served
-  through the plugin's `/TranscodeDownloader/Download/{id}` endpoint with a proper
-  `Content-Disposition` header.
-
-The picker says all of this before you choose, so no transcode is started by surprise.
-Downloading through a normal browser on the same phone has none of these limitations.
-
-## How it works
-
-The plugin embeds a small client script and serves it from a plugin API endpoint
-(`GET /TranscodeDownloader/ClientScript`). It then injects a single `<script>` tag into the
-Jellyfin web client's `index.html` — **in memory**, via the File Transformation companion
-plugin, so it never writes to Jellyfin's web directory. This is what makes it work on
-standard package and Docker installs where the web root is read-only, and it survives
-Jellyfin web updates.
-
-A second endpoint, `GET /TranscodeDownloader/Codecs`, reports which video and audio encoders
-this server's FFmpeg actually has and which the administrator permits. Unlike the script and
-translation endpoints it requires a logged-in session, because it exposes server encoding
-configuration. If it is unreachable the picker quietly falls back to H.264/AAC only.
-
-## Requirements
-
-- **Jellyfin 10.11.x** (built against the 10.11.8 SDK; ABI floor `10.11.8.0`).
-- **File Transformation plugin** (>= **v2.2.1.0**) — strongly recommended (see below).
-- For HEVC or AV1 downloads: an FFmpeg build with the matching encoder, **and** the
-  corresponding **Dashboard → Playback** toggle enabled (both are off by default).
-
-### Installing File Transformation (one-time)
-
-1. In Jellyfin: **Dashboard → Plugins → Repositories → Add**, then add the File
-   Transformation plugin repository.
-2. **Dashboard → Plugins → Catalog**, install **File Transformation**.
+1. In Jellyfin go to **Dashboard → Plugins → Repositories → Add** and paste:
+   `https://raw.githubusercontent.com/BlackPool25/Jellyfin-Transcode-Downloader/main/repo/manifest.json`
+2. **Dashboard → Plugins → Catalog** → install **Transcode Downloader**.
 3. Restart Jellyfin.
 
-> Without File Transformation, the plugin falls back to patching `index.html` on disk.
-> On most installs that directory is **read-only**, so the fallback fails and the button
-> will not appear — the server log will say so and recommend installing File Transformation.
-> **No filesystem permission changes are needed** when File Transformation is installed.
+**Option B — manual install:**
 
-## Installing Transcode Downloader
-
-### Production (stable releases)
-
-1. Add this plugin's repository URL under **Dashboard → Plugins → Repositories**:
-   ```
-   https://raw.githubusercontent.com/ph15ch/Jellyfin-Transcode-Downloader/main/repo/manifest.json
-   ```
-2. Install **Transcode Downloader** from the catalog.
+1. Download the zip from the
+   [latest release](https://github.com/BlackPool25/Jellyfin-Transcode-Downloader/releases).
+2. Extract `Jellyfin.Plugin.TranscodeDownloader.dll` (+ `logo.png`) into a folder named
+   `Transcode Downloader_<version>` inside your Jellyfin `plugins` directory
+   (e.g. `/config/plugins/` on Docker), owned by the Jellyfin user.
 3. Restart Jellyfin.
 
-### Testing (pre-release builds)
+Requires **Jellyfin 12.x** (built against the 12.4 SDK). No companion plugins needed —
+the script injects itself in memory and survives web updates.
 
-To follow test/pre-release builds, use the testing manifest instead:
+## Usage
 
-1. Add the **testing** repository URL under **Dashboard → Plugins → Repositories**:
-   ```
-   https://raw.githubusercontent.com/ph15ch/Jellyfin-Transcode-Downloader/main/repo/manifest-testing.json
-   ```
-2. Install **Transcode Downloader** from the catalog.
-3. Restart Jellyfin.
+1. Open any movie or episode → **⋯ menu → Download (Transcode…)**.
+   (Use Jellyfin's own **Download** button for the untouched original.)
+2. Pick codec, format, audio and subtitle tracks. The summary line shows exactly what
+   you'll get: `1080p · 4 Mbps · ~890 MB · Saves into 📁 Downloads.`
+3. Pick a quality (★ = recommended) and press **Download**.
+   - Desktop Chrome/Edge: a save dialog (or your saved folder — set it once via
+     **Save to → Choose folder…**).
+   - Jellyfin Android app / mobile browsers / other browsers: the download hands off to
+     the browser with the real filename — track it in your downloads list.
+4. Season/series pages get their own entries: check seasons → quality → review →
+   pick a folder once → `Series/Season NN/` fills up with progress per episode.
 
-> Test builds may be unstable. They are marked as pre-releases on GitHub and only appear in
-> the testing manifest — users on the production manifest are never affected.
+## Compatibility
 
-After restart, open a movie or episode detail page and open the More menu — **"Download (Transcode…)"** appears in the list. (`[TranscodeDownloader] plugin loaded` prints in the browser console.)
+| Client | Status |
+|---|---|
+| Jellyfin web (Chrome/Edge/Firefox desktop) | Full picker, queue, stream-to-disk saves |
+| Jellyfin Android app | Full picker; downloads hand to the system browser with real filenames |
+| Mobile browsers (Android Chrome, iOS Safari) | Full picker; single downloads via browser (no save picker on mobile) |
+| iOS / Safari / Apple TV targets | H.264 + AAC recommended; HEVC/Opus/MKV flagged before you start |
+| Jellyfin TV apps | Not applicable — native UIs with no web action sheets |
 
-## Building from source
+Server-side it uses your existing Jellyfin transcode pipeline (VA-API/NVENC/QSV incl.
+HDR tone-mapping where configured), so no extra setup beyond what playback already needs.
 
+## Troubleshooting / FAQ
+
+**I don't see "Download (Transcode…)".**
+Hard-refresh the web client (`Ctrl+Shift+R`, or long-press reload on mobile). The page
+caches `index.html` from before the plugin was installed. Verify with:
+`document.querySelector('script[src*="TranscodeDownloader"]')` in DevTools console —
+it should end in the installed version (e.g. `?v=1.5.1.0`).
+
+**The file is bigger than expected / quality looks unchanged.**
+VBR encoding varies ±15% around the estimate. If you picked a rung at/above the source
+bitrate the plugin now warns you (`identical to the original`) — take Original instead.
+
+**My subtitles are missing / unstyled.**
+ASS styling and PGS image subs only survive via **burn-in** (toggle it on, pick the one
+track). Soft-embed (`mov_text` in MP4) strips styling; MKV preserves more. Extra checked
+languages always arrive as `.srt` sidecars.
+
+**Downloads fail with HTTP 401.**
+On Jellyfin 12+, legacy `?api_key=` auth is rejected server-side. This fork sends the
+session token correctly (header in-page, `?ApiKey=` for browser handoffs). If you see
+401s, hard-refresh first — a stale cached script is the usual cause.
+
+**Batch stopped / tab closed mid-download.**
+Waiting items persist and resume from zero on next load (you'll get a notice). An
+interrupted file is never kept as a "success" — failed rows stay with Retry.
+
+**A transcode never finishes / freezes.**
+Long 4K software encodes (especially AV1) can take hours; the queue has a stall guard.
+Prefer HEVC + hardware, or drop a rung.
+
+## Development
+
+Prerequisites: .NET 10 SDK (`mcr.microsoft.com/dotnet/sdk:10.0` works for the Docker-only
+crowd) and Node.js (for the jsdom smoke tests in `../..` — see below).
+
+```bash
+dotnet build src/JellyfinTranscodeDownloader.csproj -c Release
+dotnet publish src/JellyfinTranscodeDownloader.csproj -c Release -o publish/ -p:Version="X.Y.Z"
 ```
-dotnet publish src/JellyfinTranscodeDownloader.csproj -c Release -o publish/ -p:Version=1.2.3
+
+Headless UI tests live in [`tests/`](tests/) (jsdom — no browser needed):
+
+```bash
+cd tests && npm install && npm test
 ```
 
-The output `Jellyfin.Plugin.TranscodeDownloader.dll` is the entire plugin (the client
-script is an embedded resource).
+`smoke.js` drives the real `web/plugin.js`: sheet open → tier pick → codec toggle →
+download to 100% → queue clear → Original download. `clients-matrix.js` asserts 21
+behaviours across simulated Android app, iOS Safari, desktop Chromium and mobile
+browser profiles. Both fail on any `ReferenceError`.
 
-## Creating a release
+- `web/plugin.js` is the entire client (embedded resource, served at
+  `/TranscodeDownloader/ClientScript`). No build step, no framework.
+- Static checks + headless flow tests live next to the repo (jsdom harness covering
+  open → pick → download → 100% → queue clear, mobile/Android/iOS profiles).
+- Releases are manual: tag `vX.Y.Z` (annotated, changelog as the message), publish the
+  DLL + `logo.png` as `jellyfin-transcode-downloader_X.Y.Z.zip`, prepend the entry to
+  `repo/manifest.json` (`targetAbi` = Jellyfin line, e.g. `12.4.0.0`).
 
-Releases are fully tag-driven — no manual edits to the manifest or workflow inputs needed.
+## Credits
 
-### Production release
-
-1. **Write the changelog** as the message of an annotated git tag:
-   ```
-   git tag -a v1.2.3 -m "Short description of what changed"
-   git push origin v1.2.3
-   ```
-
-2. **The `Release` workflow fires automatically** and:
-   - Validates the tag is annotated (lightweight tags are rejected)
-   - Builds with `dotnet publish -p:Version=1.2.3`
-   - Zips the DLL → `jellyfin-transcode-downloader_1.2.3.zip`
-   - Prepends a new version entry to `repo/manifest.json` on `main`
-   - Creates a GitHub release and uploads the zip
-
-### Test release
-
-Use the `test/vX.Y.Z.N` tag prefix (note the **4-component version**). This triggers a
-separate workflow that writes **only** to `repo/manifest-testing.json` and marks the
-GitHub release as a pre-release. The production `repo/manifest.json` is never touched.
-
-```
-git tag -a test/v1.2.3.1 -m "Short description of what changed"
-git push origin test/v1.2.3.1
-```
-
-The first three components (`X.Y.Z`) match the upcoming production release; `N` is an
-iteration counter starting at 1. For example, test builds leading up to `v1.0.23` would
-be `test/v1.0.23.1`, `test/v1.0.23.2`, etc. The workflow enforces 4 components and
-rejects 3-component tags.
-
-The `Release (Testing)` workflow runs identically to the production one, except:
-- The zip is named `jellyfin-transcode-downloader_1.2.3.1-test.zip`
-- The manifest entry goes into `repo/manifest-testing.json`
-- The GitHub release is marked as a pre-release
-
-> **Versions are immutable within each manifest** — pushing a tag whose version already
-> exists in the target manifest will hard-fail the workflow. Cut a new tag to re-release.
+Upstream project by [ph15ch](https://github.com/ph15ch/Jellyfin-Transcode-Downloader) and
+contributors — the menu injection, transcode flow and queue design originate there. This
+fork ports it to Jellyfin 12, adds the phone-first UI, tracks/subtitles handling, batch
+folders, saved locations and mobile support. Jellyfin itself is
+[GPL-licensed](https://github.com/jellyfin/jellyfin); this plugin is MIT (see LICENSE —
+change it if you prefer another license).
