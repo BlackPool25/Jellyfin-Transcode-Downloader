@@ -1452,6 +1452,12 @@
             const src = currentSource;
             const sourceMB = src && src.Size ? (src.Size / 1_000_000).toFixed(0) : null;
             infoEl.textContent = sourceMB ? `Original ~${sourceMB} MB on server` : '';
+            const vStream = src && (src.MediaStreams || []).find(s => s.Type === 'Video');
+            const range = vStream && (vStream.VideoRangeType || vStream.VideoRange);
+            if (range && !['sdr', 'unknown'].includes(String(range).toLowerCase())) {
+                infoEl.textContent += ` · ${range} source — downloads are tone-mapped to SDR.`;
+                infoEl.style.color = '#d0a24c';
+            }
             if (navigator.storage && navigator.storage.estimate) {
                 navigator.storage.estimate().then(({ quota }) => {
                     if (!quota) return;
@@ -1493,20 +1499,10 @@
                 const btn = makeMenuItem('video_settings', `${star}${tier.resolution} · ${formatBitrate(bitrate)}${sizeHint}`, () => {
                     scrim.remove();
                     if (batchOpt && batchOpt.episodes) {
-                        // Whole-selection batch: one folder picker, then every episode
-                        // streams to Series/Season NN/ subfolders.
-                        getApiClient(0, 5, async (client) => {
-                            const token = client.accessToken();
-                            const baseUrl = client.serverAddress() || window.location.origin;
-                            const dirHandle = await pickBatchDirectory();
-                            if (!dirHandle) return;
-                            const bStreams = (currentSource && currentSource.MediaStreams) || [];
-                            const bSubs = bStreams.filter(s => s.Type === 'Subtitle');
-                            enqueueEpisodeBatch(client, token, baseUrl, dirHandle,
-                                batchOpt.episodes, tier, bitrate, videoCodec, audioCodec,
-                                batchOpt.seriesTitle,
-                                extraSubtitleLangs(bSubs, selectedSubtitleLanguage));
-                        });
+                        // Whole-selection batch: review per-episode track resolution first,
+                        // then one folder picker and Series/Season NN/ output.
+                        startBatchReview(batchOpt.episodes, batchOpt.seriesTitle || '',
+                            tier, bitrate, videoCodec, audioCodec);
                     } else if (batchSeason) {
                         getApiClient(0, 5, async (client) => {
                             const token = client.accessToken();
@@ -1531,13 +1527,7 @@
                                 showTransientNotice(t('NoTranscodeOptions'));
                                 return;
                             }
-                            const dirHandle = await pickBatchDirectory();
-                            if (!dirHandle) return;
-                            const sStreams = (currentSource && currentSource.MediaStreams) || [];
-                            const sSubs = sStreams.filter(s => s.Type === 'Subtitle');
-                            enqueueEpisodeBatch(client, token, baseUrl, dirHandle, eps,
-                                tier, bitrate, videoCodec, audioCodec, item.SeriesName,
-                                extraSubtitleLangs(sSubs, selectedSubtitleLanguage));
+                            startBatchReview(eps, item.SeriesName || '', tier, bitrate, videoCodec, audioCodec);
                         });
                     } else {
                         const tracks = resolveEpisodeTracks(item, currentSource,
@@ -1695,6 +1685,137 @@
             }
         }
         showTransientNotice(`Queued ${queued} episode${queued === 1 ? '' : 's'}.`);
+    }
+
+    // Batch planning: resolve every episode's tracks up front so the user sees
+    // exactly what each episode will get — per season — instead of discovering
+    // gaps after hours of transcoding. Language choice is global; episodes whose
+    // layout differs fall back per-episode and get flagged here.
+    function planBatchEpisodes(episodes) {
+        const rows = [];
+        for (const ep of episodes) {
+            const sources = ep.MediaSources || [];
+            if (sources.length === 0) {
+                rows.push({ ep, ok: false, reason: 'no playable source', audioMismatch: true, subMismatch: true });
+                continue;
+            }
+            const tracks = resolveEpisodeTracks(ep, sources[0], null, null, selectedSubtitleMode);
+            let audioLang = null;
+            if (tracks.audioStreamIndex != null) {
+                const a = sources[0].MediaStreams.find(s => s.Index === tracks.audioStreamIndex);
+                audioLang = a ? ((a.Language || a.DisplayLanguage) || 'und') : null;
+            }
+            let subLang = null;
+            if (tracks.subtitleStreamIndex != null) {
+                const s = sources[0].MediaStreams.find(x => x.Index === tracks.subtitleStreamIndex);
+                subLang = s ? ((s.Language || s.DisplayLanguage) || 'und') : null;
+            }
+            const wantSub = selectedSubtitleMode !== 'none';
+            const audioMismatch = !!selectedAudioLanguage
+                && !!audioLang
+                && audioLang.toLowerCase() !== selectedAudioLanguage.toLowerCase();
+            const subMismatch = wantSub && (!subLang
+                || (!!selectedSubtitleLanguage && subLang.toLowerCase() !== selectedSubtitleLanguage.toLowerCase()));
+            rows.push({ ep, ok: true, tracks, audioLang, subLang, audioMismatch, subMismatch });
+        }
+        return rows;
+    }
+
+    function startBatchDownload(episodes, seriesTitle, tier, bitrate, videoCodec, audioCodec) {
+        getApiClient(0, 5, async (client) => {
+            const token = client.accessToken();
+            const baseUrl = client.serverAddress() || window.location.origin;
+            const dirHandle = await pickBatchDirectory();
+            if (!dirHandle) return;
+            const firstSrc = (episodes[0] && episodes[0].MediaSources && episodes[0].MediaSources[0]) || null;
+            const firstSubs = firstSrc ? (firstSrc.MediaStreams || []).filter(s => s.Type === 'Subtitle') : [];
+            const langs = extraSubtitleLangs(firstSubs, selectedSubtitleLanguage);
+            enqueueEpisodeBatch(client, token, baseUrl, dirHandle, episodes, tier, bitrate,
+                videoCodec, audioCodec, seriesTitle, langs);
+        });
+    }
+
+    // Season-grouped mismatch review. Two honest choices, no silent surprises:
+    // download everything (fallbacks applied where flagged) or skip the flagged ones.
+    function startBatchReview(episodes, seriesTitle, tier, bitrate, videoCodec, audioCodec) {
+        const rows = planBatchEpisodes(episodes);
+        const playable = rows.filter(r => r.ok);
+        if (playable.length === 0) {
+            showTransientNotice(t('NoTranscodeOptions'));
+            return;
+        }
+        const bad = rows.filter(r => r.audioMismatch || r.subMismatch);
+        if (bad.length === 0) {
+            startBatchDownload(playable.map(r => r.ep), seriesTitle, tier, bitrate, videoCodec, audioCodec);
+            return;
+        }
+        const bySeason = {};
+        for (const r of rows) {
+            const key = r.ep.SeasonName || `Season ${r.ep.ParentIndexNumber || '?'}`;
+            (bySeason[key] = bySeason[key] || []).push(r);
+        }
+        const scrim = document.createElement('div');
+        scrim.style.cssText = 'position:fixed;inset:0;z-index:10000;display:flex;align-items:flex-end;justify-content:center;background:rgba(0,0,0,0.5);';
+        scrim.addEventListener('click', (e) => { if (e.target === scrim) scrim.remove(); });
+        const sheet = document.createElement('div');
+        sheet.style.cssText = 'background:#1a1a1a;border-radius:12px 12px 0 0;width:100%;max-width:600px;max-height:80vh;overflow-y:auto;padding:16px 20px 24px;color:#fff;';
+        const header = document.createElement('div');
+        header.style.cssText = 'font-size:15px;font-weight:600;margin-bottom:4px;';
+        header.textContent = 'Check episodes before downloading';
+        sheet.appendChild(header);
+        const sub = document.createElement('div');
+        sub.style.cssText = 'font-size:12px;color:#888;margin-bottom:12px;';
+        sub.textContent = 'Some episodes differ from your picks — fallbacks are shown. Choose how to handle them.';
+        sheet.appendChild(sub);
+        for (const [season, list] of Object.entries(bySeason)) {
+            const flagged = list.filter(r => r.audioMismatch || r.subMismatch);
+            const h = document.createElement('div');
+            h.style.cssText = 'font-size:13px;font-weight:600;margin:10px 0 4px;';
+            h.textContent = `${season} · ${list.length} episodes${flagged.length ? ` · ${flagged.length} flagged` : ''}`;
+            sheet.appendChild(h);
+            for (const r of flagged.slice(0, 8)) {
+                const line = document.createElement('div');
+                line.style.cssText = 'font-size:12px;color:#d0a24c;padding:2px 0 2px 12px;';
+                const epName = `E${r.ep.IndexNumber || '?'} ${r.ep.Name || ''}`.trim();
+                const why = [];
+                if (r.audioMismatch) why.push(`audio → ${r.audioLang || 'default'}`);
+                if (r.subMismatch) why.push(r.subLang ? `subs → ${r.subLang}` : 'no subs');
+                line.textContent = `${epName} (${why.join(', ')})`;
+                sheet.appendChild(line);
+            }
+            if (flagged.length > 8) {
+                const more = document.createElement('div');
+                more.style.cssText = 'font-size:12px;color:#888;padding-left:12px;';
+                more.textContent = `…and ${flagged.length - 8} more`;
+                sheet.appendChild(more);
+            }
+        }
+        const mkBtn = (label, primary, onClick) => {
+            const b = document.createElement('button');
+            b.type = 'button';
+            b.textContent = label;
+            b.style.cssText = 'margin-top:12px;width:100%;padding:10px;border-radius:6px;font-size:14px;cursor:pointer;color:#fff;'
+                + (primary
+                    ? 'border:1px solid #00a4dc;background:rgba(0,164,220,0.2);'
+                    : 'border:1px solid #444;background:transparent;');
+            b.addEventListener('click', () => { scrim.remove(); onClick(); });
+            sheet.appendChild(b);
+            return b;
+        };
+        mkBtn(`Download all ${playable.length} anyway`, true, () => {
+            startBatchDownload(playable.map(r => r.ep), seriesTitle, tier, bitrate, videoCodec, audioCodec);
+        });
+        mkBtn(`Skip ${bad.length} flagged`, false, () => {
+            const good = rows.filter(r => r.ok && !r.audioMismatch && !r.subMismatch).map(r => r.ep);
+            if (good.length === 0) {
+                showTransientNotice(t('NoTranscodeOptions'));
+                return;
+            }
+            startBatchDownload(good, seriesTitle, tier, bitrate, videoCodec, audioCodec);
+        });
+        mkBtn('Cancel', false, () => { /* sheet already removed */ });
+        scrim.appendChild(sheet);
+        document.body.appendChild(scrim);
     }
 
     async function pickBatchDirectory() {
