@@ -1,7 +1,91 @@
 (() => {
-    const SUPPORTED_LOCALES = ['en-us', 'de', 'fr', 'es', 'zh-cn', 'nl'];
+    // ---- Transcode Downloader styles ----
+    // Single stylesheet (classes support focus rings, hover states and
+    // prefers-reduced-motion — none of which inline cssText can express).
+    // Surfaces borrow Jellyfin/ElegantFin language: blurred dark glass,
+    // hairline borders, 14-20px radii, cyan accent.
+    const QD_CSS = `
+    .qd-scrim{position:fixed;inset:0;z-index:10000;display:flex;align-items:flex-end;justify-content:center;
+      background:rgba(0,0,0,.66);backdrop-filter:blur(2px);-webkit-backdrop-filter:blur(2px);}
+    .qd-sheet{background:rgba(28,28,34,.92);backdrop-filter:blur(20px) saturate(1.2);-webkit-backdrop-filter:blur(20px) saturate(1.2);
+      border:1px solid rgba(255,255,255,.10);border-bottom:none;border-radius:20px 20px 0 0;
+      box-shadow:0 -8px 40px rgba(0,0,0,.5);
+      width:100%;max-width:600px;max-height:84dvh;overflow-y:auto;padding:8px 20px calc(20px + env(safe-area-inset-bottom));}
+    @media (min-width:640px){.qd-sheet{border-bottom:1px solid rgba(255,255,255,.10);border-radius:20px;margin-bottom:5vh;}}
+    .qd-grip{padding:12px 0 8px;cursor:grab;touch-action:none;}
+    .qd-grip-bar{width:40px;height:5px;border-radius:3px;background:rgba(255,255,255,.28);margin:0 auto;}
+    .qd-close{position:absolute;top:12px;right:12px;width:44px;height:44px;border-radius:50%;border:1px solid rgba(255,255,255,.10);
+      background:rgba(255,255,255,.05);color:#b8b8c0;font-size:18px;cursor:pointer;line-height:1;}
+    .qd-close:hover{color:#fff;background:rgba(255,255,255,.12);}
+    .qd-title{font-size:17px;font-weight:700;color:#fff;padding:12px 40px 4px 0;}
+    .qd-sub{font-size:13px;color:#b8b8c0;margin-bottom:16px;line-height:1.45;}
+    .qd-section-title{font-size:13px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:#8e8e96;margin:20px 0 8px;}
+    .qd-chip{min-height:44px;padding:10px 18px;border-radius:999px;font-size:14px;font-weight:600;font-family:inherit;
+      color:#b8b8c0;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.10);cursor:pointer;}
+    .qd-chip:hover{color:#fff;border-color:rgba(255,255,255,.25);}
+    .qd-chip[aria-pressed="true"]{color:#fff;background:rgba(0,164,220,.16);border-color:#00a4dc;}
+    .qd-chip:disabled{opacity:.55;cursor:not-allowed;}
+    .qd-chip:focus-visible,.qd-btn:focus-visible,.qd-rowbtn:focus-visible,.qd-check input:focus-visible,.qd-close:focus-visible,.qd-select:focus-visible{outline:2px solid #00a4dc;outline-offset:2px;}
+    .qd-check{display:flex;align-items:center;gap:12px;min-height:44px;padding:10px 12px;border-radius:12px;font-size:14px;color:#f2f2f5;cursor:pointer;}
+    .qd-check:hover{background:rgba(255,255,255,.05);}
+    .qd-check input{width:22px;height:22px;accent-color:#00a4dc;flex-shrink:0;}
+    .qd-check small{display:block;font-size:13px;color:#b8b8c0;font-weight:400;}
+    .qd-note{font-size:13px;color:#8e8e96;margin-top:8px;line-height:1.45;}
+    .qd-warn{font-size:13px;color:#e8b44f;background:rgba(232,180,79,.10);border:1px solid rgba(232,180,79,.3);
+      border-radius:12px;padding:10px 12px;margin-top:8px;line-height:1.45;}
+    .qd-select{width:100%;min-height:44px;padding:12px 40px 12px 14px;border-radius:12px;font-size:14px;color:#f2f2f5;
+      background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.10);}
+    .qd-toggle{display:flex;align-items:center;justify-content:space-between;width:100%;min-height:52px;padding:12px 16px;
+      border-radius:14px;font-size:14px;font-family:inherit;color:#fff;cursor:pointer;background:transparent;border:1px solid rgba(255,255,255,.10);}
+    .qd-toggle[aria-pressed="true"]{border-color:#00a4dc;background:rgba(0,164,220,.16);}
+    .qd-pill{display:inline-block;font-size:12px;font-weight:700;color:#00a4dc;background:rgba(0,164,220,.16);
+      border-radius:999px;padding:2px 10px;margin-left:8px;vertical-align:middle;}
+    .qd-onoff{font-size:12px;font-weight:700;border-radius:999px;padding:2px 10px;}
+    .qd-onoff.on{color:#fff;background:#00a4dc;}
+    .qd-onoff.off{color:#8e8e96;background:rgba(255,255,255,.08);}
+    .qd-tier{border:1px solid transparent;border-radius:12px;}
+    .qd-tier.qd-tier-selected{background:rgba(0,164,220,.16);border-color:#00a4dc;}
+    .qd-btn{display:block;width:100%;min-height:52px;margin:16px 0 0;border-radius:14px;font-size:16px;font-weight:700;
+      font-family:inherit;color:#fff;cursor:pointer;
+      background:linear-gradient(180deg,#0fb5ef,#0093c4);border:1px solid #00a4dc;box-shadow:0 4px 16px rgba(0,164,220,.35);}
+    .qd-btn:active{transform:scale(.98);}
+    .qd-btn:disabled{opacity:.45;cursor:not-allowed;box-shadow:none;}
+    .qd-btn-secondary{display:block;width:100%;min-height:48px;margin-top:12px;border-radius:14px;font-size:15px;font-weight:600;
+      font-family:inherit;color:#f2f2f5;cursor:pointer;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.10);}
+    .qd-linkbtn{background:none;border:none;color:#b8b8c0;font-size:14px;cursor:pointer;padding:12px;width:100%;text-align:center;}
+    .qd-panel{position:fixed;z-index:9999;background:rgba(28,28,34,.92);backdrop-filter:blur(20px) saturate(1.2);
+      -webkit-backdrop-filter:blur(20px) saturate(1.2);border:1px solid rgba(255,255,255,.10);border-radius:16px;
+      box-shadow:0 8px 32px rgba(0,0,0,.5);color:#fff;font-size:13px;overflow:hidden;}
+    @media (max-width:480px){.qd-panel{left:12px;right:12px;bottom:calc(12px + env(safe-area-inset-bottom));}}
+    @media (min-width:481px){.qd-panel{right:20px;bottom:20px;width:360px;}}
+    .qd-row{padding:12px 14px;border-bottom:1px solid rgba(255,255,255,.07);}
+    .qd-rowname{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600;font-size:14px;color:#f2f2f5;}
+    .qd-rowmeta{font-size:12px;color:#8e8e96;margin-bottom:4px;}
+    .qd-track{height:6px;background:rgba(255,255,255,.12);border-radius:999px;margin-bottom:4px;display:none;}
+    .qd-fill{height:100%;width:0%;background:linear-gradient(90deg,#0fb5ef,#0093c4);border-radius:999px;transition:width .2s;}
+    .qd-status{font-size:13px;color:#b8b8c0;}
+    .qd-status.failed{color:#f0837b;}
+    .qd-status.waiting{color:#8e8e96;}
+    .qd-xbtn{width:36px;height:36px;flex-shrink:0;border-radius:50%;border:1px solid rgba(255,255,255,.10);
+      background:rgba(255,255,255,.06);color:#fff;font-size:14px;cursor:pointer;}
+    .qd-retrybtn{min-height:36px;padding:8px 14px;border-radius:999px;font-size:13px;font-weight:700;font-family:inherit;
+      color:#fff;background:rgba(0,164,220,.2);border:1px solid #00a4dc;cursor:pointer;flex-shrink:0;}
+    .qd-notice{position:fixed;z-index:9999;background:rgba(28,28,34,.92);backdrop-filter:blur(20px) saturate(1.2);
+      -webkit-backdrop-filter:blur(20px) saturate(1.2);border:1px solid rgba(255,255,255,.10);border-radius:14px;
+      color:#f2f2f5;font-size:14px;padding:14px 16px;box-shadow:0 8px 32px rgba(0,0,0,.5);}
+    @media (max-width:480px){.qd-notice{left:12px;right:12px;bottom:calc(12px + env(safe-area-inset-bottom));}}
+    @media (min-width:481px){.qd-notice{right:20px;bottom:20px;max-width:400px;}}
+    @media (prefers-reduced-motion: reduce){.qd-fill{transition:none;}.qd-sheet,.qd-btn{transition:none !important;}}
+    `;
 
-    // Phone-first bitrate ladder, calibrated for H.264. Other codecs scale these by their
+    function injectStyles() {
+        if (document.getElementById('qd-styles')) return;
+        const el = document.createElement('style');
+        el.id = 'qd-styles';
+        el.textContent = QD_CSS;
+        document.head.appendChild(el);
+    }
+
     // efficiency factor so a given rung means roughly the same picture quality across codecs.
     // maxWidth/maxHeight are sent to the server so a "720p" pick cannot come back at 1080p+.
     // (Archive 2160p/1440p tiers were dropped: they defeat the phone-size goal and risk heavy
@@ -512,6 +596,7 @@
 
                 // Success: job done, clean up and drop the row.
                 stopActiveEncoding(entry);
+                showTransientNotice(`Saved ${entry.filename}`);
                 const idx = downloadQueue.indexOf(entry);
                 if (idx !== -1) downloadQueue.splice(idx, 1);
             } catch (err) {
@@ -611,10 +696,12 @@
 
         const panel = document.createElement('div');
         panel.id = 'qd-queue-panel';
-        panel.style.cssText = 'display:none;position:fixed;bottom:16px;right:16px;background:#1a1a1a;border:1px solid #444;border-radius:6px;color:#fff;font-size:13px;min-width:320px;max-width:400px;z-index:9999;font-family:monospace;overflow:hidden;';
+        panel.className = 'qd-panel';
+        panel.style.display = 'none';
 
         const list = document.createElement('div');
         list.id = 'qd-queue-list';
+        list.style.cssText = 'max-height:40dvh;overflow-y:auto;';
         panel.appendChild(list);
 
         document.body.appendChild(panel);
@@ -646,24 +733,25 @@
                 // Build the row for the first time
                 row = document.createElement('div');
                 row.dataset.entryId = entry.id;
-                row.style.cssText = 'padding:10px 14px;border-bottom:1px solid #2a2a2a;';
+                row.className = 'qd-row';
 
                 const top = document.createElement('div');
                 top.style.cssText = 'display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:4px;';
 
                 const name = document.createElement('div');
-                name.style.cssText = 'flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:bold;';
+                name.className = 'qd-rowname';
                 name.textContent = entry.filename;
 
                 const cancelBtn = document.createElement('button');
                 cancelBtn.textContent = '✕';
-                cancelBtn.style.cssText = 'padding:2px 8px;border-radius:4px;border:1px solid #666;background:#333;color:#fff;cursor:pointer;font-size:12px;flex-shrink:0;';
+                cancelBtn.className = 'qd-xbtn';
+                cancelBtn.setAttribute('aria-label', 'Cancel download');
                 cancelBtn.addEventListener('click', () => removeFromQueue(entry.id));
 
                 const retryBtn = document.createElement('button');
                 retryBtn.textContent = t('RetryDownload');
-                retryBtn.className = 'qd-retry';
-                retryBtn.style.cssText = 'display:none;padding:2px 8px;border-radius:4px;border:1px solid #00a4dc;background:rgba(0,164,220,0.2);color:#fff;cursor:pointer;font-size:12px;flex-shrink:0;';
+                retryBtn.className = 'qd-retrybtn';
+                retryBtn.style.display = 'none';
                 retryBtn.addEventListener('click', () => retryQueueEntry(entry.id));
 
                 top.appendChild(name);
@@ -674,7 +762,7 @@
                 // Codec + bitrate, so several queued items of the same title stay distinguishable
                 if (entry.codecLabel) {
                     const meta = document.createElement('div');
-                    meta.style.cssText = 'font-size:11px;color:#888;margin-bottom:4px;';
+                    meta.className = 'qd-rowmeta';
                     meta.textContent = entry.codecLabel;
                     row.appendChild(meta);
                 }
@@ -682,16 +770,16 @@
                 // Progress bar (always created; hidden for waiting items)
                 const track = document.createElement('div');
                 track.className = 'qd-track';
-                track.style.cssText = 'height:5px;background:#333;border-radius:3px;margin-bottom:4px;display:none;';
+                track.style.display = 'none';
                 const fill = document.createElement('div');
                 fill.id = `qd-fill-${entry.id}`;
-                fill.style.cssText = 'height:100%;width:0%;background:#00a4dc;border-radius:3px;transition:width 0.2s;';
+                fill.className = 'qd-fill';
                 track.appendChild(fill);
                 row.appendChild(track);
 
                 const statusEl = document.createElement('div');
                 statusEl.id = `qd-status-${entry.id}`;
-                statusEl.style.cssText = 'font-size:12px;';
+                statusEl.className = 'qd-status';
                 row.appendChild(statusEl);
 
                 // Insert at correct position
@@ -703,18 +791,21 @@
             // Update active/waiting/failed appearance without touching the fill width
             const track = row.querySelector('.qd-track');
             const statusEl = row.querySelector(`#qd-status-${entry.id}`);
-            const retryBtn = row.querySelector('.qd-retry');
+            const retryBtn = row.querySelector('.qd-retrybtn');
+            const pos = downloadQueue.findIndex(e => e.id === entry.id);
+            const queuePos = pos >= 0 ? ` · ${pos + 1} of ${downloadQueue.length}` : '';
+            statusEl.className = 'qd-status ' + (entry.status === 'failed' ? 'failed'
+                : entry.status === 'waiting' ? 'waiting' : '');
             if (entry.status === 'active') {
                 if (track) track.style.display = 'block';
-                if (statusEl) statusEl.style.color = '#aaa';
                 if (retryBtn) retryBtn.style.display = 'none';
             } else if (entry.status === 'failed') {
                 if (track) track.style.display = 'none';
-                if (statusEl) { statusEl.style.color = '#e06c60'; statusEl.textContent = entry.error || t('DownloadFailed'); }
+                if (statusEl) statusEl.textContent = entry.error || t('DownloadFailed');
                 if (retryBtn) retryBtn.style.display = '';
             } else {
                 if (track) track.style.display = 'none';
-                if (statusEl) { statusEl.style.color = '#666'; statusEl.textContent = t('Waiting'); }
+                if (statusEl) statusEl.textContent = `${t('Waiting')}${queuePos}`;
                 if (retryBtn) retryBtn.style.display = 'none';
             }
         });
@@ -788,12 +879,9 @@
 
         const notice = document.createElement('div');
         notice.id = 'qd-notice';
+        notice.className = 'qd-notice';
+        notice.setAttribute('role', 'status');
         notice.textContent = text;
-        // left+right with margin-left:auto keeps it hugging the right edge on a desktop viewport
-        // without letting it overflow the left edge of a phone narrower than max-width.
-        notice.style.cssText = 'position:fixed;bottom:16px;left:16px;right:16px;max-width:400px;margin-left:auto;'
-            + 'background:#1a1a1a;border:1px solid #444;border-radius:6px;color:#fff;font-size:13px;'
-            + 'font-family:monospace;padding:12px 16px;z-index:9999;';
         document.body.appendChild(notice);
         setTimeout(() => notice.remove(), 8000);
     }
@@ -1100,12 +1188,9 @@
 
         const chip = document.createElement('button');
         chip.type = 'button';
+        chip.className = 'qd-chip';
         chip.setAttribute('data-id', `qd-codec-${kind}-${codec.id}`);
         chip.textContent = codec.label;
-        chip.style.cssText = 'padding:6px 14px;border-radius:16px;font-size:13px;font-family:inherit;color:#fff;'
-            + `border:1px solid ${selected ? '#00a4dc' : '#444'};`
-            + `background:${selected ? 'rgba(0,164,220,0.2)' : 'transparent'};`
-            + (reason ? 'opacity:0.4;cursor:not-allowed;' : 'cursor:pointer;');
 
         if (reason) {
             chip.disabled = true;
@@ -1120,10 +1205,11 @@
 
     function buildCodecRow(catalogue, kind, label, onSelect) {
         const wrap = document.createElement('div');
-        wrap.style.cssText = 'margin-bottom:10px;';
+        wrap.style.cssText = 'margin-bottom:16px;';
 
         const title = document.createElement('div');
-        title.style.cssText = 'font-size:13px;font-weight:600;color:#fff;opacity:0.7;margin-bottom:6px;';
+        title.className = 'qd-section-title';
+        title.style.marginTop = '0';
         title.textContent = label;
         wrap.appendChild(title);
 
@@ -1138,7 +1224,7 @@
             const reason = codecBlockReason(kind, codec.id);
             if (!reason) return;
             const note = document.createElement('div');
-            note.style.cssText = 'font-size:12px;color:#888;margin-top:6px;';
+            note.className = 'qd-note';
             note.textContent = `${codec.label} — ${codecReasonText(reason)}`;
             wrap.appendChild(note);
         });
@@ -1155,14 +1241,15 @@
         if (!capability || capability.hardware) return null;
 
         const hint = document.createElement('div');
-        hint.style.cssText = 'font-size:12px;color:#d0a24c;margin-top:2px;';
+        hint.className = 'qd-warn';
+        hint.style.marginTop = '10px';
         hint.textContent = t('SoftwareEncodingHint');
         return hint;
     }
 
     function buildCodecSection(onCodecChange) {
         const section = document.createElement('div');
-        section.style.cssText = 'padding:8px 20px 4px;';
+        section.style.cssText = 'margin:0;';
 
         const render = () => {
             section.textContent = '';
@@ -1183,42 +1270,15 @@
 
     // --- Quality overlay ---
 
-    async function showQualitySheet(itemId, batchOpt) {
-        if (document.getElementById('qd-quality-sheet')) return;
-
-        // Ensure strings are loaded before rendering UI
-        if (stringsPromise) await stringsPromise;
-
-        const metadataPromise = itemMetadata(itemId);
-
-        // Runs alongside the metadata fetch; memoised for the rest of the page session.
-        const capabilitiesPromise = fetchCodecCapabilities();
-
-        const scrim = document.createElement('div');
-        scrim.id = 'qd-quality-sheet';
-        scrim.style.cssText = 'position:fixed;inset:0;z-index:10000;display:flex;align-items:flex-end;justify-content:center;background:rgba(0,0,0,0.5);';
-        scrim.addEventListener('click', (e) => { if (e.target === scrim) scrim.remove(); });
-
-        const sheet = document.createElement('div');
-        sheet.style.cssText = 'background:#1a1a1a;border-radius:12px 12px 0 0;width:100%;max-width:600px;max-height:80vh;overflow-y:auto;padding:8px 0 24px;';
-
-        const header = document.createElement('div');
-        header.style.cssText = 'padding:16px 20px 8px;font-size:15px;font-weight:600;color:#fff;opacity:0.7;';
-        header.textContent = batchOpt && batchOpt.title
-            ? `${batchOpt.title} — ${t('ChooseQuality')}`
-            : t('ChooseQuality');
-        sheet.appendChild(header);
-
-        const loadingEl = document.createElement('div');
-        loadingEl.style.cssText = 'padding:16px 20px;color:#aaa;font-size:14px;';
-        loadingEl.textContent = t('LoadingMediaInfo');
-        sheet.appendChild(loadingEl);
 
         // Drag handle: pull down to dismiss (mobile bottom-sheet behaviour).
+    // (Implemented once in addSheetChrome, above.)
+    function addSheetChrome(sheet, scrim) {
+        sheet.style.position = 'relative';
         const grip = document.createElement('div');
-        grip.style.cssText = 'padding:10px 0 4px;cursor:grab;touch-action:none;';
+        grip.className = 'qd-grip';
         const gripBar = document.createElement('div');
-        gripBar.style.cssText = 'width:36px;height:4px;border-radius:2px;background:#666;margin:0 auto;';
+        gripBar.className = 'qd-grip-bar';
         grip.appendChild(gripBar);
         sheet.insertBefore(grip, sheet.firstChild);
         let dragStartY = null;
@@ -1241,6 +1301,55 @@
         };
         grip.addEventListener('pointerup', endDrag);
         grip.addEventListener('pointercancel', () => { dragStartY = null; sheet.style.transform = ''; });
+        const closeBtn = document.createElement('button');
+        closeBtn.type = 'button';
+        closeBtn.className = 'qd-close';
+        closeBtn.setAttribute('aria-label', 'Close');
+        closeBtn.textContent = '✕';
+        closeBtn.addEventListener('click', () => scrim.remove());
+        sheet.appendChild(closeBtn);
+        const escHandler = (e) => {
+            if (e.key === 'Escape' && document.contains(scrim)) {
+                scrim.remove();
+                document.removeEventListener('keydown', escHandler);
+            }
+        };
+        document.addEventListener('keydown', escHandler);
+    }
+    async function showQualitySheet(itemId, batchOpt) {
+        if (document.getElementById('qd-quality-sheet')) return;
+
+        // Ensure strings are loaded before rendering UI
+        if (stringsPromise) await stringsPromise;
+
+        const metadataPromise = itemMetadata(itemId);
+
+        // Runs alongside the metadata fetch; memoised for the rest of the page session.
+        const capabilitiesPromise = fetchCodecCapabilities();
+
+        const scrim = document.createElement('div');
+        scrim.id = 'qd-quality-sheet';
+        scrim.className = 'qd-scrim';
+        scrim.addEventListener('click', (e) => { if (e.target === scrim) scrim.remove(); });
+
+        const sheet = document.createElement('div');
+        sheet.className = 'qd-sheet';
+        sheet.style.position = 'relative';
+
+        const header = document.createElement('div');
+        header.className = 'qd-title';
+        header.textContent = batchOpt && batchOpt.title
+            ? `${batchOpt.title} — ${t('ChooseQuality')}`
+            : t('ChooseQuality');
+        sheet.appendChild(header);
+
+        addSheetChrome(sheet, scrim);
+
+        const loadingEl = document.createElement('div');
+        loadingEl.style.cssText = 'padding:16px 20px;color:#aaa;font-size:14px;';
+        loadingEl.textContent = t('LoadingMediaInfo');
+        sheet.appendChild(loadingEl);
+
 
         scrim.appendChild(sheet);
         document.body.appendChild(scrim);
@@ -1312,11 +1421,12 @@
         function selectRow(labelText, options, currentValue, onPick) {
             const wrap = document.createElement('div');
             const title = document.createElement('div');
-            title.style.cssText = 'font-size:13px;font-weight:600;color:#fff;opacity:0.7;margin-bottom:6px;';
+            title.className = 'qd-section-title';
+            title.style.marginTop = '0';
             title.textContent = labelText;
             wrap.appendChild(title);
             const sel = document.createElement('select');
-            sel.style.cssText = 'width:100%;padding:8px;border-radius:6px;background:#222;color:#fff;border:1px solid #444;font-size:13px;';
+            sel.className = 'qd-select';
             options.forEach(o => {
                 const opt = document.createElement('option');
                 opt.value = o.value;
@@ -1334,7 +1444,7 @@
             const wrap = document.createElement('div');
             if (labelText) {
                 const title = document.createElement('div');
-                title.style.cssText = 'font-size:13px;font-weight:600;color:#fff;opacity:0.7;margin-bottom:6px;';
+                title.className = 'qd-section-title';
                 title.textContent = labelText;
                 wrap.appendChild(title);
             }
@@ -1343,11 +1453,9 @@
             options.forEach(o => {
                 const chip = document.createElement('button');
                 chip.type = 'button';
+                chip.className = 'qd-chip';
                 chip.textContent = o.label;
                 const active = currentId === o.id;
-                chip.style.cssText = 'padding:6px 14px;border-radius:16px;font-size:13px;font-family:inherit;color:#fff;cursor:pointer;'
-                    + `border:1px solid ${active ? '#00a4dc' : '#444'};`
-                    + `background:${active ? 'rgba(0,164,220,0.2)' : 'transparent'};`;
                 chip.setAttribute('aria-pressed', active ? 'true' : 'false');
                 chip.addEventListener('click', () => onPick(o.id));
                 chips.appendChild(chip);
@@ -1362,18 +1470,17 @@
             const wrap = document.createElement('div');
             if (labelText) {
                 const title = document.createElement('div');
-                title.style.cssText = 'font-size:13px;font-weight:600;color:#fff;opacity:0.7;margin-bottom:6px;';
+                title.className = 'qd-section-title';
                 title.textContent = labelText;
                 wrap.appendChild(title);
             }
             tracks.forEach(s => {
                 const label = document.createElement('label');
-                label.style.cssText = 'display:flex;align-items:center;gap:8px;padding:4px 0;font-size:13px;color:#ddd;cursor:pointer;';
+                label.className = 'qd-check';
                 const box = document.createElement('input');
                 box.type = single ? 'radio' : 'checkbox';
                 if (single) box.name = `qd-sub-${labelText || 'x'}`;
                 box.checked = checked.has(s.Index);
-                box.style.cssText = 'width:16px;height:16px;accent-color:#00a4dc;';
                 box.addEventListener('change', () => onToggle(s.Index, box.checked));
                 const span = document.createElement('span');
                 span.textContent = trackLabel(s);
@@ -1383,7 +1490,7 @@
             });
             if (noteText) {
                 const note = document.createElement('div');
-                note.style.cssText = 'font-size:12px;color:#888;margin-top:4px;';
+                note.className = 'qd-note';
                 note.textContent = noteText;
                 wrap.appendChild(note);
             }
@@ -1392,7 +1499,7 @@
 
         function buildTrackSection() {
             const section = document.createElement('div');
-            section.style.cssText = 'padding:4px 20px 8px;display:flex;flex-direction:column;gap:10px;';
+            section.style.cssText = 'display:flex;flex-direction:column;gap:4px;';
             const render = () => {
                 section.textContent = '';
                 const streams = (currentSource && currentSource.MediaStreams) || [];
@@ -1442,15 +1549,12 @@
                     const burnOn = selectedSubtitleMode === 'burn';
                     const toggle = document.createElement('button');
                     toggle.type = 'button';
+                    toggle.className = 'qd-toggle';
                     toggle.setAttribute('aria-pressed', burnOn ? 'true' : 'false');
-                    toggle.style.cssText = 'display:flex;align-items:center;justify-content:space-between;width:100%;'
-                        + 'padding:8px 14px;border-radius:8px;font-size:13px;font-family:inherit;color:#fff;cursor:pointer;'
-                        + `border:1px solid ${burnOn ? '#00a4dc' : '#444'};`
-                        + `background:${burnOn ? 'rgba(0,164,220,0.2)' : 'transparent'};margin-bottom:6px;`;
                     const toggleLabel = document.createElement('span');
                     toggleLabel.textContent = 'Burn subtitles into video';
                     const toggleState = document.createElement('span');
-                    toggleState.style.cssText = `font-weight:700;color:${burnOn ? '#00a4dc' : '#888'};`;
+                    toggleState.className = 'qd-onoff ' + (burnOn ? 'on' : 'off');
                     toggleState.textContent = burnOn ? 'ON' : 'OFF';
                     toggle.appendChild(toggleLabel);
                     toggle.appendChild(toggleState);
@@ -1460,7 +1564,7 @@
                         refreshTiers();
                     });
                     const subHead = document.createElement('div');
-                    subHead.style.cssText = 'font-size:13px;font-weight:600;color:#fff;opacity:0.7;margin:8px 0 6px;';
+                    subHead.className = 'qd-section-title';
                     subHead.textContent = 'Subtitles';
                     section.appendChild(subHead);
                     section.appendChild(toggle);
@@ -1498,11 +1602,13 @@
         const durationSeconds = item.RunTimeTicks ? item.RunTimeTicks / 10_000_000 : 0;
 
         const infoEl = document.createElement('div');
-        infoEl.style.cssText = 'padding:0 20px 8px;font-size:12px;color:#888;';
+        infoEl.className = 'qd-note';
+        infoEl.style.margin = '8px 0 0';
         sheet.appendChild(infoEl);
 
         function updateSourceInfo() {
-            infoEl.style.color = '#888';
+            infoEl.className = 'qd-note';
+            infoEl.style.margin = '8px 0 0';
             const src = currentSource;
             const sourceMB = src && src.Size ? (src.Size / 1_000_000).toFixed(0) : null;
             infoEl.textContent = sourceMB ? `Original ~${sourceMB} MB on server` : '';
@@ -1510,7 +1616,7 @@
             const range = vStream && (vStream.VideoRangeType || vStream.VideoRange);
             if (range && !['sdr', 'unknown'].includes(String(range).toLowerCase())) {
                 infoEl.textContent += ` · ${range} source — downloads are tone-mapped to SDR.`;
-                infoEl.style.color = '#d0a24c';
+                infoEl.className = 'qd-warn';
             }
             if (navigator.storage && navigator.storage.estimate) {
                 navigator.storage.estimate().then(({ quota }) => {
@@ -1532,6 +1638,10 @@
 
         const tierList = document.createElement('div');
 
+        // Selection lives at sheet scope so codec/container toggles re-render tiers
+        // without resetting it (only re-clamped if the scaled rung exceeds source).
+        let pendingTier = null; // QUALITY_TIERS object; scaled at download time
+        let tierTouched = false;
         const renderTiers = () => {
             tierList.textContent = '';
             const tiers = sheetTiers();
@@ -1546,8 +1656,6 @@
                 if (scaleBitrate(t.bitrate, factor) <= cap) recIdx = i;
             });
 
-            let pendingTier = null; // QUALITY_TIERS object; scaled at download time
-            let tierTouched = false;
             for (const [ti, tier] of tiers.entries()) {
                 const bitrate = scaleBitrate(tier.bitrate, factor);
                 const sizeHint = durationSeconds > 0 ? ` · ${formatSize(bitrate * durationSeconds / 8)}` : '';
@@ -1555,19 +1663,23 @@
                 if (!tierTouched && !pendingTier && ti === recIdx) pendingTier = tier;
                 const selected = pendingTier === tier;
                 const btn = makeMenuItem('video_settings',
-                    `${selected ? '● ' : ''}${star}${tier.resolution} · ${formatBitrate(bitrate)}${sizeHint}`, () => {
+                    `${star}${tier.resolution} · ${formatBitrate(bitrate)}${sizeHint}`, () => {
                     pendingTier = tier;
                     tierTouched = true;
                     renderTiers();
                     refreshSummary();
                 });
-                if (selected) btn.style.border = '1px solid #00a4dc';
+                btn.classList.add('qd-tier');
+                if (selected) btn.classList.add('qd-tier-selected');
+                btn.setAttribute('aria-pressed', selected ? 'true' : 'false');
                 tierList.appendChild(btn);
             }
 
             if (tiers.length === 0) {
                 const empty = document.createElement('div');
-                empty.style.cssText = 'padding:16px 20px;color:#aaa;font-size:14px;';
+                empty.className = 'qd-note';
+                empty.style.textAlign = 'center';
+                empty.style.padding = '20px';
                 empty.textContent = t('NoTranscodeOptions');
                 tierList.appendChild(empty);
             }
@@ -1577,28 +1689,34 @@
         // offers those codecs, so warn instead of hiding — the user may be downloading
         // for VLC on the same iPhone.
         const appleWarn = document.createElement('div');
-        appleWarn.style.cssText = 'display:none;padding:0 20px 8px;font-size:12px;color:#d0a24c;';
+        appleWarn.className = 'qd-warn';
+        appleWarn.style.display = 'none';
         appleWarn.textContent = t('AppleCodecWarning');
 
         const refreshTiers = () => {
             renderTiers();
             const risky = selectedVideoCodec === 'hevc' || selectedAudioCodec === 'opus';
-            const mkvWarn = selectedContainer === 'mkv' && isApplePlayer();
-            appleWarn.style.display = (isApplePlayer() && (risky || selectedContainer === 'mkv')) ? '' : 'none';
-            if (appleWarn.style.display !== 'none') {
-                appleWarn.textContent = t('AppleCodecWarning')
-                    + (mkvWarn ? ' MKV needs VLC or Infuse on Apple devices.' : '');
+            const showWarn = risky || selectedContainer === 'mkv';
+            appleWarn.style.display = showWarn ? '' : 'none';
+            if (showWarn) {
+                appleWarn.textContent = isApplePlayer()
+                    ? t('AppleCodecWarning')
+                        + (selectedContainer === 'mkv' ? ' MKV needs VLC or Infuse on Apple devices.' : '')
+                    : 'Heads up if this file is for an iPhone/iPad/Apple TV: ' + t('AppleCodecWarning')
+                        + (selectedContainer === 'mkv' ? ' MKV needs VLC or Infuse on Apple devices.' : '');
             }
             refreshSummary();
         };
 
         const summaryEl = document.createElement('div');
-        summaryEl.style.cssText = 'padding:8px 20px;font-size:13px;color:#ddd;min-height:20px;';
+        summaryEl.className = 'qd-note';
+        summaryEl.style.minHeight = '20px';
+        const legendEl = document.createElement('div');
+        legendEl.className = 'qd-note';
+        legendEl.textContent = '★ best for phones — highest quality at or under ~4 Mbps. Sizes are estimates (±15% VBR).';
         const dlBtn = document.createElement('button');
         dlBtn.type = 'button';
-        dlBtn.style.cssText = 'margin:4px 20px 8px;width:calc(100% - 40px);padding:12px;border-radius:8px;'
-            + 'font-size:15px;font-weight:700;font-family:inherit;color:#fff;cursor:pointer;'
-            + 'border:1px solid #00a4dc;background:rgba(0,164,220,0.35);';
+        dlBtn.className = 'qd-btn';
         dlBtn.addEventListener('click', () => doDownload());
 
         const refreshSummary = () => {
@@ -1606,12 +1724,16 @@
             dlBtn.textContent = batchOpt ? `Download ${count} episode${count === 1 ? '' : 's'}`
                 : batchSeason ? 'Download season'
                 : 'Download';
-            if (!pendingTier) {
-                summaryEl.textContent = 'Pick a quality above.';
-                dlBtn.style.opacity = '0.5';
+            const hasTiers = sheetTiers().length > 0;
+            dlBtn.disabled = !pendingTier || !hasTiers;
+            if (!hasTiers) {
+                summaryEl.textContent = 'This source is below our smallest rung — no transcode options.';
                 return;
             }
-            dlBtn.style.opacity = '';
+            if (!pendingTier) {
+                summaryEl.textContent = 'Pick a quality above. ★ = best size-for-quality on phones (±15% VBR estimates).';
+                return;
+            }
             const bitrate = scaleBitrate(pendingTier.bitrate, videoCodecFactor(selectedVideoCodec));
             const size = durationSeconds > 0 ? formatSize(bitrate * durationSeconds / 8) : 'unknown size';
             let where;
@@ -1627,6 +1749,8 @@
             if (!pendingTier) return;
             const tier = pendingTier;
             const bitrate = scaleBitrate(tier.bitrate, videoCodecFactor(selectedVideoCodec));
+            const videoCodec = selectedVideoCodec;
+            const audioCodec = selectedAudioCodec;
             scrim.remove();
             if (batchOpt && batchOpt.episodes) {
                 startBatchReview(batchOpt.episodes, batchOpt.seriesTitle || '',
@@ -1701,8 +1825,15 @@
             sheet.appendChild(batchBtn);
         }
 
+        if (typeof window.showSaveFilePicker !== 'function' && !isAndroidAppWebView()) {
+            const memWarn = document.createElement('div');
+            memWarn.className = 'qd-warn';
+            memWarn.textContent = 'This browser holds the whole file in memory until the download finishes — keep this tab open. 1080p films can exceed 2 GB.';
+            sheet.appendChild(memWarn);
+        }
         refreshTiers();
         sheet.appendChild(tierList);
+        sheet.appendChild(legendEl);
         sheet.appendChild(summaryEl);
         sheet.appendChild(dlBtn);
         refreshSummary();
@@ -1863,27 +1994,28 @@
             (bySeason[key] = bySeason[key] || []).push(r);
         }
         const scrim = document.createElement('div');
-        scrim.style.cssText = 'position:fixed;inset:0;z-index:10000;display:flex;align-items:flex-end;justify-content:center;background:rgba(0,0,0,0.5);';
+        scrim.className = 'qd-scrim';
         scrim.addEventListener('click', (e) => { if (e.target === scrim) scrim.remove(); });
         const sheet = document.createElement('div');
-        sheet.style.cssText = 'background:#1a1a1a;border-radius:12px 12px 0 0;width:100%;max-width:600px;max-height:80vh;overflow-y:auto;padding:16px 20px 24px;color:#fff;';
+        sheet.className = 'qd-sheet';
         const header = document.createElement('div');
-        header.style.cssText = 'font-size:15px;font-weight:600;margin-bottom:4px;';
+        header.className = 'qd-title';
         header.textContent = 'Check episodes before downloading';
         sheet.appendChild(header);
         const sub = document.createElement('div');
-        sub.style.cssText = 'font-size:12px;color:#888;margin-bottom:12px;';
+        sub.className = 'qd-sub';
         sub.textContent = 'Some episodes differ from your picks — fallbacks are shown. Choose how to handle them.';
         sheet.appendChild(sub);
         for (const [season, list] of Object.entries(bySeason)) {
             const flagged = list.filter(r => r.audioMismatch || r.subMismatch);
             const h = document.createElement('div');
-            h.style.cssText = 'font-size:13px;font-weight:600;margin:10px 0 4px;';
+            h.className = 'qd-section-title';
             h.textContent = `${season} · ${list.length} episodes${flagged.length ? ` · ${flagged.length} flagged` : ''}`;
             sheet.appendChild(h);
             for (const r of flagged.slice(0, 8)) {
                 const line = document.createElement('div');
-                line.style.cssText = 'font-size:12px;color:#d0a24c;padding:2px 0 2px 12px;';
+                line.className = 'qd-warn';
+                line.style.margin = '4px 0 4px 12px;';
                 const epName = `E${r.ep.IndexNumber || '?'} ${r.ep.Name || ''}`.trim();
                 const why = [];
                 if (r.audioMismatch) why.push(`audio → ${r.audioLang || 'default'}`);
@@ -1893,7 +2025,8 @@
             }
             if (flagged.length > 8) {
                 const more = document.createElement('div');
-                more.style.cssText = 'font-size:12px;color:#888;padding-left:12px;';
+                more.className = 'qd-note';
+                more.style.paddingLeft = '12px';
                 more.textContent = `…and ${flagged.length - 8} more`;
                 sheet.appendChild(more);
             }
@@ -1902,10 +2035,7 @@
             const b = document.createElement('button');
             b.type = 'button';
             b.textContent = label;
-            b.style.cssText = 'margin-top:12px;width:100%;padding:10px;border-radius:6px;font-size:14px;cursor:pointer;color:#fff;'
-                + (primary
-                    ? 'border:1px solid #00a4dc;background:rgba(0,164,220,0.2);'
-                    : 'border:1px solid #444;background:transparent;');
+            b.className = primary ? 'qd-btn' : 'qd-btn-secondary';
             b.addEventListener('click', () => { scrim.remove(); onClick(); });
             sheet.appendChild(b);
             return b;
@@ -1922,6 +2052,7 @@
             startBatchDownload(good, seriesTitle, tier, bitrate, videoCodec, audioCodec);
         });
         mkBtn('Cancel', false, () => { /* sheet already removed */ });
+        addSheetChrome(sheet, scrim);
         scrim.appendChild(sheet);
         document.body.appendChild(scrim);
     }
@@ -2018,16 +2149,17 @@
             });
 
             const scrim = document.createElement('div');
-            scrim.style.cssText = 'position:fixed;inset:0;z-index:10000;display:flex;align-items:flex-end;justify-content:center;background:rgba(0,0,0,0.5);';
+            scrim.className = 'qd-scrim';
             scrim.addEventListener('click', (e) => { if (e.target === scrim) scrim.remove(); });
             const sheet = document.createElement('div');
-            sheet.style.cssText = 'background:#1a1a1a;border-radius:12px 12px 0 0;width:100%;max-width:600px;max-height:80vh;overflow-y:auto;padding:16px 20px 24px;color:#fff;';
+            sheet.className = 'qd-sheet';
             const header = document.createElement('div');
-            header.style.cssText = 'font-size:15px;font-weight:600;margin-bottom:4px;';
+            header.className = 'qd-title';
             header.textContent = item.Type === 'Season' ? `Download season (Transcode…)` : `Download series (Transcode…)`;
             sheet.appendChild(header);
             const sub = document.createElement('div');
-            sub.style.cssText = 'font-size:12px;color:#888;margin-bottom:12px;';
+            sub.className = 'qd-sub';
+            sub.style.marginBottom = '12px';
             sub.textContent = (item.Name || '')
                 + ' — batch uses your primary audio + subtitle picks; extra tracks stay single-download only.';
             sheet.appendChild(sub);
@@ -2036,17 +2168,20 @@
             seasons.forEach(s => {
                 const count = (bySeason[s.Id] || []).length;
                 const label = document.createElement('label');
-                label.style.cssText = 'display:flex;align-items:center;gap:8px;padding:6px 0;font-size:14px;cursor:pointer;';
+                label.className = 'qd-check';
                 const box = document.createElement('input');
                 box.type = 'checkbox';
                 box.checked = true;
-                box.style.cssText = 'width:16px;height:16px;accent-color:#00a4dc;';
                 box.addEventListener('change', () => {
                     if (box.checked) checked.add(s.Id);
                     else checked.delete(s.Id);
                 });
                 const span = document.createElement('span');
-                span.textContent = `${s.Name || 'Season'} · ${count} episode${count === 1 ? '' : 's'}`;
+                span.innerHTML = '';
+                span.textContent = `${s.Name || 'Season'}`;
+                const small = document.createElement('small');
+                small.textContent = ` · ${count} episode${count === 1 ? '' : 's'}`;
+                span.appendChild(small);
                 label.appendChild(box);
                 label.appendChild(span);
                 sheet.appendChild(label);
@@ -2054,8 +2189,8 @@
 
             const go = document.createElement('button');
             go.type = 'button';
+            go.className = 'qd-btn';
             go.textContent = 'Choose quality…';
-            go.style.cssText = 'margin-top:12px;width:100%;padding:10px;border-radius:6px;border:1px solid #00a4dc;background:rgba(0,164,220,0.2);color:#fff;font-size:14px;cursor:pointer;';
             go.addEventListener('click', () => {
                 const chosen = episodes.filter(ep =>
                     checked.has(ep.SeasonId || (item.Type === 'Season' ? item.Id : 'unknown')));
@@ -2073,6 +2208,7 @@
                 });
             });
             sheet.appendChild(go);
+            addSheetChrome(sheet, scrim);
             scrim.appendChild(sheet);
             document.body.appendChild(scrim);
         });
@@ -2247,6 +2383,7 @@
         const mediaSource = (item.MediaSources || []).find(s => s.Id === spec.mediaSourceId)
             || item.MediaSources[0];
         const mediaSourceId = mediaSource && mediaSource.Id ? mediaSource.Id : itemId;
+        const ext = spec.container === 'mkv' ? 'mkv' : 'mp4';
         // Identifies the server-side transcoding job so it can be killed (and its temp file
         // deleted) once the download ends. Both are per-download and synthetic: the pair also
         // seeds the transcode's output filename, so a fresh id keeps a new download from picking
@@ -2271,7 +2408,6 @@
 
         const videoTag = codecTag(VIDEO_CODECS, videoCodec);
         const audioTag = codecTag(AUDIO_CODECS, audioCodec);
-        const ext = spec.container === 'mkv' ? 'mkv' : 'mp4';
         const suffix = ` [${videoTag} ${formatBitrate(bitrate).replace(' ', '')} ${audioTag}${spec.nameTag ? ' ' + spec.nameTag : ''}]`;
 
         const pad = (n) => (Number.isFinite(Number(n)) ? String(n).padStart(2, '0') : '??');
@@ -2368,6 +2504,7 @@
         onHashChange();
     }
 
+    injectStyles();
     injectQueuePanel();
     initStrings();
     flushPendingStops();

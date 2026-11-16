@@ -81,7 +81,9 @@ and bitrate. The active item displays a progress bar; items waiting to start sho
 Each item has its own **✕** cancel button — cancelling removes only that item and the next one
 starts automatically. The panel disappears when the queue is empty.
 
-The queue is in-memory only: closing or reloading the browser tab clears it.
+Waiting entries survive a reload: their specs are kept in `localStorage` and resume
+(processing restarts automatically, from zero — bytes already received are lost, and
+restored rows fall back to in-memory download since file handles can't persist).
 
 Cancelling mid-download aborts the in-progress request cleanly; no partial file is saved.
 
@@ -98,8 +100,9 @@ changes after you pick a tier:
 
 - there is **no progress bar, queue or cancel button** — the transfer belongs to the browser,
   so track it in the browser's own downloads list;
-- the file is saved as **`stream.mp4`** rather than `Movie (2020) [AV1 4Mbps AAC].mp4`, because
-  Jellyfin's stream endpoint doesn't tell the browser what to call it. Rename it afterwards.
+- the file arrives **with its real name** (`Movie (2020) [H264 4Mbps AAC].mp4`), served
+  through the plugin's `/TranscodeDownloader/Download/{id}` endpoint with a proper
+  `Content-Disposition` header.
 
 The picker says all of this before you choose, so no transcode is started by surprise.
 Downloading through a normal browser on the same phone has none of these limitations.
