@@ -1,23 +1,20 @@
 (() => {
     const SUPPORTED_LOCALES = ['en-us', 'de', 'fr', 'es', 'zh-cn', 'nl'];
 
-    // Bitrate rungs, calibrated for H.264. Other codecs scale these by their efficiency
-    // factor so a given rung means roughly the same picture quality across codecs.
+    // Phone-first bitrate ladder, calibrated for H.264. Other codecs scale these by their
+    // efficiency factor so a given rung means roughly the same picture quality across codecs.
+    // maxWidth/maxHeight are sent to the server so a "720p" pick cannot come back at 1080p+.
+    // (Archive 2160p/1440p tiers were dropped: they defeat the phone-size goal and risk heavy
+    // 4K tone-map jobs on small servers.)
     const QUALITY_TIERS = [
-        { resolution: '2160p', bitrate: 120_000_000 },
-        { resolution: '2160p', bitrate:  80_000_000 },
-        { resolution: '2160p', bitrate:  60_000_000 },
-        { resolution: '2160p', bitrate:  40_000_000 },
-        { resolution: '2160p', bitrate:  20_000_000 },
-        { resolution: '1440p', bitrate:  15_000_000 },
-        { resolution: '1440p', bitrate:  10_000_000 },
-        { resolution: '1080p', bitrate:   8_000_000 },
-        { resolution: '1080p', bitrate:   6_000_000 },
-        { resolution: '720p',  bitrate:   4_000_000 },
-        { resolution: '720p',  bitrate:   3_000_000 },
-        { resolution: '720p',  bitrate:   1_500_000 },
-        { resolution: '480p',  bitrate:     720_000 },
-        { resolution: '360p',  bitrate:     420_000 },
+        { resolution: '1080p', bitrate: 6_000_000,  maxWidth: 1920, maxHeight: 1080 },
+        { resolution: '1080p', bitrate: 4_000_000,  maxWidth: 1920, maxHeight: 1080 },
+        { resolution: '720p',  bitrate: 3_000_000,  maxWidth: 1280, maxHeight: 720 },
+        { resolution: '720p',  bitrate: 2_500_000,  maxWidth: 1280, maxHeight: 720 },
+        { resolution: '720p',  bitrate: 1_500_000,  maxWidth: 1280, maxHeight: 720 },
+        { resolution: '720p',  bitrate: 1_200_000,  maxWidth: 1280, maxHeight: 720 },
+        { resolution: '480p',  bitrate:   800_000,  maxWidth: 854,  maxHeight: 480 },
+        { resolution: '480p',  bitrate:   500_000,  maxWidth: 854,  maxHeight: 480 },
     ];
 
     // --- Codecs ---
@@ -83,6 +80,33 @@
         return `${Math.round(bitrate / 1000)} kbps`;
     }
 
+    // Jellyfin 12.x rejects the legacy lowercase ?api_key= query param (and dual
+    // query+header auth). In-page fetches carry the session token as an Authorization
+    // header; only the Android browser-handoff URL — which cannot carry headers —
+    // uses ?ApiKey= (capital A, the one 12.x still honours).
+    function authHeaders(token) {
+        return { 'Authorization': `MediaBrowser Token="${token}"` };
+    }
+
+    // Best-effort Apple player detection for the hev1 / Opus-in-MP4 warnings.
+    function isApplePlayer() {
+        const ua = navigator.userAgent || '';
+        if (/iPhone|iPad|iPod/i.test(ua)) return true;
+        // Safari on macOS, excluding Chromium-based browsers that also contain "Safari".
+        return /Safari/i.test(ua) && !/Chrome|Chromium|Edg|OPR/i.test(ua);
+    }
+
+    // Filenames come from server metadata (titles with /, :, ?, emoji...). Strip what
+    // Windows/FAT/exFAT forbid, collapse whitespace, cap length. Never return empty.
+    function sanitizeFilename(name, fallback) {
+        const cleaned = String(name == null ? '' : name)
+            .replace(/[/\\:*?"<>|\x00-\x1f]/g, '')
+            .replace(/\s+/g, ' ')
+            .trim()
+            .slice(0, 120);
+        return cleaned || fallback;
+    }
+
     // --- i18n ---
 
     // Fallback strings used when strings fetch fails or locale is en-us.
@@ -104,6 +128,8 @@
         BrowserHandoffHint: 'The Jellyfin Android app cannot save downloads itself, so this opens in your browser. The file is saved as stream.mp4 — rename it afterwards.',
         BrowserHandoffStarted: 'Handed to your browser — check its downloads.',
         BrowserHandoffFailed: 'Could not open your browser.',
+        AppleCodecWarning: 'Heads up: Apple players cannot play HEVC videos tagged hev1, and ignore Opus audio in MP4. Pick H.264 + AAC for iPhone/iPad.',
+        RetryDownload: 'Retry',
     };
 
     // Populated by initStrings(); null until loaded.
@@ -195,7 +221,9 @@
         const stopUrl = entry.stopUrl;
         entry.stopUrl = null; // never fire twice for the same job
         try {
-            fetch(stopUrl, { method: 'DELETE', keepalive: true }).catch((err) => {
+            const init = { method: 'DELETE', keepalive: true };
+            if (entry.token) init.headers = authHeaders(entry.token);
+            fetch(stopUrl, init).catch((err) => {
                 console.warn('[TranscodeDownloader] failed to stop server transcode:', err);
             });
         } catch (err) {
@@ -210,9 +238,9 @@
         downloadQueue.forEach(stopActiveEncoding);
     });
 
-    function buildStopUrl(baseUrl, deviceId, playSessionId, token) {
+    function buildStopUrl(baseUrl, deviceId, playSessionId) {
         return `${baseUrl}/Videos/ActiveEncodings?deviceId=${encodeURIComponent(deviceId)}`
-            + `&playSessionId=${playSessionId}&api_key=${token}`;
+            + `&playSessionId=${encodeURIComponent(playSessionId)}`;
     }
 
     // --- Deferred transcode cleanup (browser handoff only) ---
@@ -264,8 +292,8 @@
             const token = client.accessToken();
             const baseUrl = client.serverAddress() || window.location.origin;
             due.forEach((entry) => {
-                const url = buildStopUrl(entry.baseUrl || baseUrl, entry.deviceId, entry.playSessionId, token);
-                fetch(url, { method: 'DELETE' }).catch((err) => {
+                const url = buildStopUrl(entry.baseUrl || baseUrl, entry.deviceId, entry.playSessionId);
+                fetch(url, { method: 'DELETE', headers: authHeaders(token) }).catch((err) => {
                     console.warn('[TranscodeDownloader] deferred transcode stop failed:', err);
                 });
             });
@@ -297,19 +325,39 @@
         // If we cancelled the active item, processQueue will be called by the fetch .finally
     }
 
+    function retryQueueEntry(id) {
+        const entry = downloadQueue.find(e => e.id === id);
+        if (!entry || entry.status !== 'failed' || !entry.spec) return;
+        // Fresh session ids: reusing a PlaySessionId can resume a stale server job.
+        const parts = buildDownloadParts(entry.spec);
+        entry.url = parts.url;
+        entry.stopUrl = parts.stopUrl;
+        entry.filename = parts.filename;
+        entry.estimatedBytes = parts.estimatedBytes;
+        entry.receivedBytes = 0;
+        entry.error = null;
+        entry.status = 'waiting';
+        entry.abortController = null;
+        renderQueue();
+        if (!queueProcessing) processQueue();
+    }
+
     async function processQueue() {
         if (queueProcessing) return;
-        if (downloadQueue.length === 0) return;
+        if (!downloadQueue.some(e => e.status === 'waiting')) return;
 
         queueProcessing = true;
-        while (downloadQueue.length > 0) {
-            const entry = downloadQueue[0];
+        for (;;) {
+            const entry = downloadQueue.find(e => e.status === 'waiting');
+            if (!entry) break;
             entry.status = 'active';
             entry.abortController = new AbortController();
             renderQueue();
 
             try {
-                const response = await fetch(entry.url, { signal: entry.abortController.signal });
+                const init = { signal: entry.abortController.signal };
+                if (entry.token) init.headers = authHeaders(entry.token);
+                const response = await fetch(entry.url, init);
                 if (!response.ok) {
                     const httpError = new Error(`HTTP ${response.status}`);
                     httpError.status = response.status;
@@ -319,21 +367,27 @@
                 triggerBlobDownload(blob, entry.filename);
                 updateEntryProgress(entry, 1, entry.estimatedBytes);
                 await new Promise(r => setTimeout(r, 1000));
+
+                // Success: job done, clean up and drop the row.
+                stopActiveEncoding(entry);
+                const idx = downloadQueue.indexOf(entry);
+                if (idx !== -1) downloadQueue.splice(idx, 1);
             } catch (err) {
-                if (err.name !== 'AbortError') {
+                if (err.name === 'AbortError') {
+                    // Cancelled by the user: drop the row like before.
+                    stopActiveEncoding(entry);
+                    const idx = downloadQueue.indexOf(entry);
+                    if (idx !== -1) downloadQueue.splice(idx, 1);
+                } else {
+                    // Failed: stop the server job but KEEP the row with the reason,
+                    // so the user can retry instead of re-picking codec and tier.
                     console.error('[TranscodeDownloader] Download failed:', err);
-                    updateEntryStatus(entry, describeFailure(entry, err));
-                    await new Promise(r => setTimeout(r, 3000));
+                    stopActiveEncoding(entry);
+                    entry.status = 'failed';
+                    entry.error = describeFailure(entry, err);
+                    entry.abortController = null;
                 }
             }
-
-            // Whether the download finished, failed, or was aborted, the server-side job is done
-            // with — and it will not clean up its own temp file.
-            stopActiveEncoding(entry);
-
-            // Remove this entry (whether done, failed, or aborted)
-            const idx = downloadQueue.indexOf(entry);
-            if (idx !== -1) downloadQueue.splice(idx, 1);
             renderQueue();
         }
         queueProcessing = false;
@@ -430,7 +484,14 @@
                 cancelBtn.style.cssText = 'padding:2px 8px;border-radius:4px;border:1px solid #666;background:#333;color:#fff;cursor:pointer;font-size:12px;flex-shrink:0;';
                 cancelBtn.addEventListener('click', () => removeFromQueue(entry.id));
 
+                const retryBtn = document.createElement('button');
+                retryBtn.textContent = t('RetryDownload');
+                retryBtn.className = 'qd-retry';
+                retryBtn.style.cssText = 'display:none;padding:2px 8px;border-radius:4px;border:1px solid #00a4dc;background:rgba(0,164,220,0.2);color:#fff;cursor:pointer;font-size:12px;flex-shrink:0;';
+                retryBtn.addEventListener('click', () => retryQueueEntry(entry.id));
+
                 top.appendChild(name);
+                top.appendChild(retryBtn);
                 top.appendChild(cancelBtn);
                 row.appendChild(top);
 
@@ -463,15 +524,22 @@
                 else list.appendChild(row);
             }
 
-            // Update active/waiting appearance without touching the fill width
+            // Update active/waiting/failed appearance without touching the fill width
             const track = row.querySelector('.qd-track');
             const statusEl = row.querySelector(`#qd-status-${entry.id}`);
+            const retryBtn = row.querySelector('.qd-retry');
             if (entry.status === 'active') {
                 if (track) track.style.display = 'block';
                 if (statusEl) statusEl.style.color = '#aaa';
+                if (retryBtn) retryBtn.style.display = 'none';
+            } else if (entry.status === 'failed') {
+                if (track) track.style.display = 'none';
+                if (statusEl) { statusEl.style.color = '#e06c60'; statusEl.textContent = entry.error || t('DownloadFailed'); }
+                if (retryBtn) retryBtn.style.display = '';
             } else {
                 if (track) track.style.display = 'none';
                 if (statusEl) { statusEl.style.color = '#666'; statusEl.textContent = t('Waiting'); }
+                if (retryBtn) retryBtn.style.display = 'none';
             }
         });
     }
@@ -481,10 +549,16 @@
         const statusEl = document.getElementById(`qd-status-${entry.id}`);
         if (!fill || !statusEl) return;
 
+        const receivedMB = receivedBytes != null ? (receivedBytes / 1_048_576).toFixed(1) : null;
+        if (!estimatedBytes) {
+            // Runtime unknown: show bytes only, never NaN%.
+            fill.style.width = receivedMB != null ? '100%' : '0%';
+            statusEl.textContent = receivedMB != null ? `${receivedMB} MB downloaded` : '';
+            return;
+        }
         const pct = Math.min(Math.round(ratio * 100), 100);
         fill.style.width = pct + '%';
 
-        const receivedMB = receivedBytes != null ? (receivedBytes / 1_048_576).toFixed(1) : null;
         const estimatedMB = (estimatedBytes / 1_048_576).toFixed(1);
         statusEl.textContent = receivedMB != null
             ? `${receivedMB} MB / ~${estimatedMB} MB · ${pct}%`
@@ -716,7 +790,9 @@
             getApiClient(0, 10, async (client) => {
                 try {
                     const baseUrl = client.serverAddress() || window.location.origin;
-                    const res = await fetch(`${baseUrl}/TranscodeDownloader/Codecs?api_key=${encodeURIComponent(client.accessToken())}`);
+                    const res = await fetch(`${baseUrl}/TranscodeDownloader/Codecs`, {
+                        headers: authHeaders(client.accessToken()),
+                    });
                     if (!res.ok) throw new Error(`HTTP ${res.status}`);
                     const payload = await res.json();
 
@@ -978,9 +1054,10 @@
 
         const source = item && item.MediaSources && item.MediaSources[0];
         // Filtered on the H.264-calibrated base bitrate so the set of rungs on offer stays
-        // stable when the codec changes — only their encoder targets move.
+        // stable when the codec changes — only their encoder targets move. A rung exactly
+        // equal to the source bitrate is a legitimate (near-lossless) choice, not excluded.
         const tiers = source && source.Bitrate
-            ? QUALITY_TIERS.filter(tier => tier.bitrate < source.Bitrate)
+            ? QUALITY_TIERS.filter(tier => tier.bitrate <= source.Bitrate)
             : QUALITY_TIERS;
 
         const tierList = document.createElement('div');
@@ -993,7 +1070,7 @@
                 const bitrate = scaleBitrate(tier.bitrate, factor);
                 const btn = makeMenuItem('video_settings', `${tier.resolution} · ${formatBitrate(bitrate)}`, () => {
                     scrim.remove();
-                    onTranscodeMenuClick(bitrate, item.Id || itemId, item);
+                    onTranscodeMenuClick(tier, bitrate, item.Id || itemId, item);
                 });
                 tierList.appendChild(btn);
             }
@@ -1006,10 +1083,24 @@
             }
         };
 
+        // Apple players refuse hev1-tagged HEVC and ignore Opus-in-MP4. The server still
+        // offers those codecs, so warn instead of hiding — the user may be downloading
+        // for VLC on the same iPhone.
+        const appleWarn = document.createElement('div');
+        appleWarn.style.cssText = 'display:none;padding:0 20px 8px;font-size:12px;color:#d0a24c;';
+        appleWarn.textContent = t('AppleCodecWarning');
+
+        const refreshTiers = () => {
+            renderTiers();
+            const risky = selectedVideoCodec === 'hevc' || selectedAudioCodec === 'opus';
+            appleWarn.style.display = (isApplePlayer() && risky) ? '' : 'none';
+        };
+
         // Only offered when the server told us what it can encode; otherwise the flow stays
         // exactly as it was, on H.264/AAC.
         if (codecCapabilitiesResolved) {
-            sheet.insertBefore(buildCodecSection(renderTiers), header);
+            sheet.insertBefore(buildCodecSection(refreshTiers), header);
+            sheet.insertBefore(appleWarn, header);
         }
 
         // Said before the choice, not after: picking a tier in the app leaves for the browser
@@ -1021,13 +1112,13 @@
             sheet.appendChild(handoffHint);
         }
 
-        renderTiers();
+        refreshTiers();
         sheet.appendChild(tierList);
     }
 
     // --- Download actions ---
 
-    function onTranscodeMenuClick(bitrate, itemId, item) {
+    function onTranscodeMenuClick(tier, bitrate, itemId, item) {
         if (!item) return;
         // Captured now: the sheet is gone, but the selection must not drift before the
         // ApiClient callback runs.
@@ -1036,11 +1127,14 @@
         getApiClient(0, 5, (client) => {
             const token = client.accessToken();
             const baseUrl = client.serverAddress() || window.location.origin;
-            addToQueue(baseUrl, itemId, token, bitrate, item, videoCodec, audioCodec);
+            addToQueue(baseUrl, itemId, token, tier, bitrate, item, videoCodec, audioCodec);
         });
     }
 
-    function addToQueue(baseUrl, itemId, token, selectedBitrate, item, videoCodec, audioCodec) {
+    // Pure builder so a failed entry can be retried with fresh session ids without
+    // re-picking codec and tier. Nothing here touches the queue or the network.
+    function buildDownloadParts(spec) {
+        const { baseUrl, itemId, tier, bitrate, item, videoCodec, audioCodec } = spec;
         const mediaSourceId = item.MediaSources && item.MediaSources[0] && item.MediaSources[0].Id
             ? item.MediaSources[0].Id
             : itemId;
@@ -1053,42 +1147,62 @@
         const deviceId = `transcode-downloader-${playSessionId}`;
         // A single codec is sent deliberately: a comma-separated list lets the server silently
         // downgrade while the UI still claims the codec the user picked.
-        const url = `${baseUrl}/Videos/${itemId}/stream.mp4?MediaSourceId=${mediaSourceId}&VideoBitrate=${selectedBitrate}&VideoCodec=${videoCodec}&AudioCodec=${audioCodec}&MaxAudioChannels=2&allowVideoStreamCopy=false&allowAudioStreamCopy=false&Static=false&PlaySessionId=${playSessionId}&DeviceId=${encodeURIComponent(deviceId)}&api_key=${token}`;
-        // Nothing below this point applies inside the Android app: there is no queue entry, no
-        // progress and no filename of ours once the browser owns the transfer.
-        if (isAndroidAppWebView()) {
-            handOffToBrowser(url, baseUrl, deviceId, playSessionId);
-            return;
-        }
-
-        const stopUrl = buildStopUrl(baseUrl, deviceId, playSessionId, token);
+        // MaxWidth/MaxHeight pin the picked rung — VideoBitrate alone lets the server
+        // return a higher resolution than the label promises.
+        const url = `${baseUrl}/Videos/${itemId}/stream.mp4?MediaSourceId=${mediaSourceId}`
+            + `&VideoBitrate=${bitrate}&MaxWidth=${tier.maxWidth}&MaxHeight=${tier.maxHeight}`
+            + `&VideoCodec=${videoCodec}&AudioCodec=${audioCodec}&MaxAudioChannels=2`
+            + `&allowVideoStreamCopy=false&allowAudioStreamCopy=false&Static=false`
+            + `&PlaySessionId=${playSessionId}&DeviceId=${encodeURIComponent(deviceId)}`;
+        const stopUrl = buildStopUrl(baseUrl, deviceId, playSessionId);
 
         const videoTag = codecTag(VIDEO_CODECS, videoCodec);
         const audioTag = codecTag(AUDIO_CODECS, audioCodec);
-        const suffix = ` [${videoTag} ${formatBitrate(selectedBitrate).replace(' ', '')} ${audioTag}]`;
+        const suffix = ` [${videoTag} ${formatBitrate(bitrate).replace(' ', '')} ${audioTag}]`;
 
-        const pad = (n) => String(n).padStart(2, '0');
+        const pad = (n) => (Number.isFinite(Number(n)) ? String(n).padStart(2, '0') : '??');
         let filename;
         if (item.Type === 'Movie') {
-            filename = `${item.Name} (${item.ProductionYear})${suffix}.mp4`;
+            filename = `${item.Name} (${item.ProductionYear || '????'})${suffix}.mp4`;
         } else if (item.Type === 'Episode') {
             filename = `${item.SeriesName} S${pad(item.ParentIndexNumber)}E${pad(item.IndexNumber)} - ${item.Name}${suffix}.mp4`;
         } else {
             filename = `download${suffix}.mp4`;
         }
+        filename = sanitizeFilename(filename, `download${suffix}.mp4`);
 
-        const durationSeconds = item.RunTimeTicks / 10_000_000;
-        const estimatedBytes = (selectedBitrate * durationSeconds) / 8;
+        const durationSeconds = item.RunTimeTicks ? item.RunTimeTicks / 10_000_000 : 0;
+        const estimatedBytes = durationSeconds > 0 ? (bitrate * durationSeconds) / 8 : 0;
+
+        return {
+            url, stopUrl, filename, estimatedBytes, deviceId, playSessionId,
+            videoCodec, audioCodec,
+            codecLabel: `${videoTag} · ${formatBitrate(bitrate)} · ${audioTag}`,
+        };
+    }
+
+    function addToQueue(baseUrl, itemId, token, tier, bitrate, item, videoCodec, audioCodec) {
+        const spec = { baseUrl, itemId, tier, bitrate, item, videoCodec, audioCodec };
+        const parts = buildDownloadParts(spec);
+        // Nothing below this point applies inside the Android app: there is no queue entry, no
+        // progress and no filename of ours once the browser owns the transfer. The handoff URL
+        // carries ?ApiKey= because a browser intent cannot send an Authorization header.
+        if (isAndroidAppWebView()) {
+            handOffToBrowser(`${parts.url}&ApiKey=${encodeURIComponent(token)}`, baseUrl, parts.deviceId, parts.playSessionId);
+            return;
+        }
 
         enqueue({
             id: `${itemId}-${Date.now()}`,
-            filename,
-            estimatedBytes,
-            url,
-            stopUrl,
-            videoCodec,
-            audioCodec,
-            codecLabel: `${videoTag} · ${formatBitrate(selectedBitrate)} · ${audioTag}`,
+            spec,
+            token,
+            filename: parts.filename,
+            estimatedBytes: parts.estimatedBytes,
+            url: parts.url,
+            stopUrl: parts.stopUrl,
+            videoCodec: parts.videoCodec,
+            audioCodec: parts.audioCodec,
+            codecLabel: parts.codecLabel,
             receivedBytes: 0,
             abortController: null,
             status: 'waiting',

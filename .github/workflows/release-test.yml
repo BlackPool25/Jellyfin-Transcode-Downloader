@@ -39,7 +39,7 @@ jobs:
       - name: Set up .NET
         uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: '9.0.x'
+          dotnet-version: '10.0.x'
 
       - name: Derive version and read changelog from tag
         id: meta
@@ -147,7 +147,7 @@ jobs:
           jq \
             --arg version   "${FULL_VERSION}" \
             --arg changelog "${CHANGELOG}" \
-            --arg targetAbi "10.11.8.0" \
+            --arg targetAbi "12.4.0.0" \
             --arg sourceUrl "${SOURCE_URL}" \
             --arg checksum  "${CHECKSUM}" \
             --arg timestamp "${TIMESTAMP}" \
