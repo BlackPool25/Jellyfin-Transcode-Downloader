@@ -9,6 +9,14 @@
     "imageUrl": "https://raw.githubusercontent.com/ph15ch/Jellyfin-Transcode-Downloader/main/logo.png",
     "versions": [
       {
+        "version": "1.2.1.0",
+        "changelog": "Audit fixes: restored queue auto-starts, working retry for sidecars, unchecked-means-none subtitle handling, batch subtitle sidecars in episode folders, null-safe filenames, KB size display",
+        "targetAbi": "12.4.0.0",
+        "sourceUrl": "https://github.com/BlackPool25/Jellyfin-Transcode-Downloader/releases/download/v1.2.1/jellyfin-transcode-downloader_1.2.1.zip",
+        "checksum": "509aba27b56db5a94357bdacec152f7b",
+        "timestamp": "2026-11-16T02:41:12Z"
+      },
+      {
         "version": "1.2.0.0",
         "changelog": "Multi-track downloads + series folders: audio/subtitle checklists (sidecar .srt, extra-audio downloads, burn-in single enforced), MP4/MKV container choice, recommended quality rung, series/season batch entries downloading into Series/Season folders, Download endpoint filename+container support",
         "targetAbi": "12.4.0.0",
