@@ -145,8 +145,8 @@ namespace Jellyfin.Plugin.TranscodeDownloader
         /// Android browser handoff (and any direct link), which otherwise lands as
         /// <c>stream.mp4</c> because Jellyfin's stream endpoint sends no filename.
         /// Query params are the stream params (MediaSourceId, VideoBitrate, …, PlaySessionId,
-        /// DeviceId) plus <c>filename</c>; <c>ApiKey</c> is accepted for auth and stripped
-        /// before proxying to avoid dual-auth rejection on 12.x.
+        /// DeviceId) plus <c>filename</c> and <c>container</c> (mp4|mkv); <c>ApiKey</c> is
+        /// accepted for auth and stripped before proxying to avoid dual-auth rejection on 12.x.
         /// </summary>
         [HttpGet("Download/{itemId}")]
         [Authorize]
@@ -154,12 +154,16 @@ namespace Jellyfin.Plugin.TranscodeDownloader
         public async Task<ActionResult> DownloadFile(
             string itemId,
             [FromQuery] string? filename,
+            [FromQuery] string? container,
             CancellationToken cancellationToken)
         {
+            var ext = string.Equals(container, "mkv", StringComparison.OrdinalIgnoreCase) ? "mkv" : "mp4";
+            var contentType = ext == "mkv" ? "video/x-matroska" : "video/mp4";
             var forwarded = new Dictionary<string, StringValues>(StringComparer.OrdinalIgnoreCase);
             foreach (var kv in Request.Query)
             {
                 if (kv.Key.Equals("filename", StringComparison.OrdinalIgnoreCase)
+                    || kv.Key.Equals("container", StringComparison.OrdinalIgnoreCase)
                     || kv.Key.Equals("apikey", StringComparison.OrdinalIgnoreCase))
                 {
                     continue;
@@ -170,7 +174,7 @@ namespace Jellyfin.Plugin.TranscodeDownloader
 
             // Same box: Jellyfin's HTTP port serves the stream endpoint.
             var port = Request.Host.Port ?? 8096;
-            var url = "http://localhost:" + port + "/Videos/" + itemId + "/stream.mp4" + QueryString.Create(forwarded);
+            var url = "http://localhost:" + port + "/Videos/" + itemId + "/stream." + ext + QueryString.Create(forwarded);
 
             // Deliberately not disposed: the response stream is consumed by FileStreamResult
             // after this method returns. Serial download queue means one live client at a time.
@@ -199,15 +203,15 @@ namespace Jellyfin.Plugin.TranscodeDownloader
             }
 
             var stream = await upstream.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
-            return File(stream, "video/mp4", SanitizeFileName(filename), enableRangeProcessing: true);
+            return File(stream, contentType, SanitizeFileName(filename, ext), enableRangeProcessing: true);
         }
 
         /// <summary>
         /// Filenames arrive from client-side metadata; strip what filesystems forbid.
         /// </summary>
-        private static string SanitizeFileName(string? filename)
+        private static string SanitizeFileName(string? filename, string ext)
         {
-            if (string.IsNullOrWhiteSpace(filename)) return "download.mp4";
+            if (string.IsNullOrWhiteSpace(filename)) return "download." + ext;
             var name = System.IO.Path.GetFileName(filename.Trim());
             foreach (var c in System.IO.Path.GetInvalidFileNameChars())
             {
@@ -216,7 +220,7 @@ namespace Jellyfin.Plugin.TranscodeDownloader
 
             name = name.Trim();
             if (name.Length > 120) name = name.Substring(0, 120);
-            return string.IsNullOrEmpty(name) ? "download.mp4" : name;
+            return string.IsNullOrEmpty(name) ? "download." + ext : name;
         }
 
         /// <summary>

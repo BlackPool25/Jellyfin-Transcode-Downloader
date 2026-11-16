@@ -33,6 +33,9 @@
 
     const DEFAULT_VIDEO_CODEC = 'h264';
     const DEFAULT_AUDIO_CODEC = 'aac';
+    const DEFAULT_CONTAINER = 'mp4';
+
+    let selectedContainer = DEFAULT_CONTAINER;
 
     const STORAGE_VIDEO_CODEC = 'transcodeDownloader.videoCodec';
     const STORAGE_AUDIO_CODEC = 'transcodeDownloader.audioCodec';
@@ -131,7 +134,7 @@
         SoftwareEncodingHint: 'Software encoding — this can take a long time and the file is held in memory until it finishes.',
         DownloadFailedCodec: 'Download failed — the server could not encode with {codec}.',
         DownloadFailedStatus: 'Download failed (HTTP {status}).',
-        BrowserHandoffHint: 'The Jellyfin Android app cannot save downloads itself, so this opens in your browser. The file is saved as stream.mp4 — rename it afterwards.',
+        BrowserHandoffHint: 'The Jellyfin Android app cannot save downloads itself, so this opens in your browser with the real filename.',
         BrowserHandoffStarted: 'Handed to your browser — check its downloads.',
         BrowserHandoffFailed: 'Could not open your browser.',
         AppleCodecWarning: 'Heads up: Apple players cannot play HEVC videos tagged hev1, and ignore Opus audio in MP4. Pick H.264 + AAC for iPhone/iPad.',
@@ -348,6 +351,7 @@
                     stopUrl: parts.stopUrl,
                     videoCodec: parts.videoCodec,
                     audioCodec: parts.audioCodec,
+                    mimeType: parts.mimeType,
                     codecLabel: parts.codecLabel,
                     receivedBytes: 0,
                     abortController: null,
@@ -419,6 +423,21 @@
         if (!queueProcessing) processQueue();
     }
 
+    async function downloadSidecar(entry) {
+        await ensureEntryToken(entry);
+        const init = {};
+        if (entry.token) init.headers = authHeaders(entry.token);
+        const response = await fetch(entry.url, init);
+        if (!response.ok) {
+            const httpError = new Error(`HTTP ${response.status}`);
+            httpError.status = response.status;
+            throw httpError;
+        }
+        const buf = await response.arrayBuffer();
+        if (!buf.byteLength) throw new Error('Transcode produced no data');
+        triggerBlobDownload(new Blob([buf], { type: 'text/plain;charset=utf-8' }), entry.filename);
+    }
+
     async function processQueue() {
         if (queueProcessing) return;
         if (!downloadQueue.some(e => e.status === 'waiting')) return;
@@ -427,6 +446,26 @@
         for (;;) {
             const entry = downloadQueue.find(e => e.status === 'waiting');
             if (!entry) break;
+            // Subtitle sidecars are tiny direct fetches, not transcodes.
+            if (entry.kind === 'subtitle') {
+                entry.status = 'active';
+                renderQueue();
+                try {
+                    await downloadSidecar(entry);
+                } catch (err) {
+                    entry.status = 'failed';
+                    entry.error = describeFailure(entry, err);
+                    entry.abortController = null;
+                    persistWaitingQueue();
+                    renderQueue();
+                    continue;
+                }
+                const idx = downloadQueue.indexOf(entry);
+                if (idx !== -1) downloadQueue.splice(idx, 1);
+                persistWaitingQueue();
+                renderQueue();
+                continue;
+            }
             entry.status = 'active';
             entry.abortController = new AbortController();
             renderQueue();
@@ -441,13 +480,15 @@
                     httpError.status = response.status;
                     throw httpError;
                 }
-                if (entry.fileHandle) {
+                if (entry.fileHandle || entry.dirHandle) {
                     // Stream straight to disk: no 2x-RAM Blob, phone-safe for 2 GB+ files.
-                    const writable = await entry.fileHandle.createWritable();
+                    const writable = entry.fileHandle
+                        ? await entry.fileHandle.createWritable()
+                        : await openBatchFile(entry);
                     await saveStreamToDisk(response.body, writable, entry.estimatedBytes, entry);
                     updateEntryProgress(entry, 1, entry.estimatedBytes);
                 } else {
-                    const blob = await readStream(response.body, entry.estimatedBytes, entry);
+                    const blob = await readStream(response.body, entry.estimatedBytes, entry, entry.mimeType);
                     triggerBlobDownload(blob, entry.filename);
                     updateEntryProgress(entry, 1, entry.estimatedBytes);
                 }
@@ -515,7 +556,7 @@
         }
     }
 
-    async function readStream(body, estimatedBytes, entry) {
+    async function readStream(body, estimatedBytes, entry, mimeType) {
         const reader = body.getReader();
         const chunks = [];
         let received = 0;
@@ -533,7 +574,18 @@
         // immediately. Without this, the user gets a 0-byte .mp4 reported as a success.
         if (received === 0) throw new Error('Transcode produced no data');
 
-        return new Blob(chunks, { type: 'video/mp4' });
+        return new Blob(chunks, { type: mimeType || 'video/mp4' });
+    }
+
+    // Batch downloads land in Series/Season XX/ folders. The directory handle comes
+    // from a single picker gesture; subfolders and files are created on demand.
+    async function openBatchFile(entry) {
+        let dir = entry.dirHandle;
+        for (const part of entry.dirPath || []) {
+            dir = await dir.getDirectoryHandle(sanitizeFilename(part, 'Unknown'), { create: true });
+        }
+        const fh = await dir.getFileHandle(entry.filename, { create: true });
+        return fh.createWritable();
     }
 
     // --- Queue panel UI ---
@@ -778,6 +830,10 @@
         const id = contextMenuItemId;
         contextMenuItemId = null;
         return id;
+    }
+
+    function peekContextMenuItemId() {
+        return contextMenuItemId;
     }
 
     function getApiClient(attempt, maxAttempts, callback, onFail) {
@@ -1111,7 +1167,7 @@
 
     // --- Quality overlay ---
 
-    async function showQualitySheet(itemId) {
+    async function showQualitySheet(itemId, batchOpt) {
         if (document.getElementById('qd-quality-sheet')) return;
 
         // Ensure strings are loaded before rendering UI
@@ -1132,7 +1188,9 @@
 
         const header = document.createElement('div');
         header.style.cssText = 'padding:16px 20px 8px;font-size:15px;font-weight:600;color:#fff;opacity:0.7;';
-        header.textContent = t('ChooseQuality');
+        header.textContent = batchOpt && batchOpt.title
+            ? `${batchOpt.title} — ${t('ChooseQuality')}`
+            : t('ChooseQuality');
         sheet.appendChild(header);
 
         const loadingEl = document.createElement('div');
@@ -1182,11 +1240,12 @@
             const audios = streams.filter(s => s.Type === 'Audio');
             const subs = streams.filter(s => s.Type === 'Subtitle');
             const defAudio = audios.find(s => s.IsDefault) || audios[0] || null;
-            selectedAudioStreamIndex = defAudio ? defAudio.Index : null;
+            selectedAudioChecked = new Set(defAudio ? [defAudio.Index] : []);
             selectedAudioLanguage = (defAudio && (defAudio.Language || defAudio.DisplayLanguage)) || null;
             if (subs.length === 0) {
                 selectedSubtitleMode = 'none';
                 selectedSubtitleStreamIndex = null;
+                selectedSubtitleChecked = new Set();
                 selectedSubtitleLanguage = null;
             } else {
                 // Burn-in is the default: the only faithful path for styled ASS and
@@ -1195,7 +1254,7 @@
                 const defSub = subs.find(s => s.IsDefault)
                     || subs.find(s => (s.Language || '').toLowerCase().startsWith('eng'))
                     || subs[0];
-                selectedSubtitleStreamIndex = defSub ? defSub.Index : null;
+                selectedSubtitleChecked = new Set(defSub ? [defSub.Index] : []);
                 selectedSubtitleLanguage = (defSub && (defSub.Language || defSub.DisplayLanguage)) || null;
             }
         }
@@ -1217,6 +1276,63 @@
             });
             sel.addEventListener('change', () => onPick(sel.value === '' ? null : Number(sel.value)));
             wrap.appendChild(sel);
+            return wrap;
+        }
+
+        // Generic chip row (container, subtitle mode): single choice.
+        function chipRow(labelText, options, currentId, onPick) {
+            const wrap = document.createElement('div');
+            if (labelText) {
+                const title = document.createElement('div');
+                title.style.cssText = 'font-size:13px;font-weight:600;color:#fff;opacity:0.7;margin-bottom:6px;';
+                title.textContent = labelText;
+                wrap.appendChild(title);
+            }
+            const chips = document.createElement('div');
+            chips.style.cssText = 'display:flex;flex-wrap:wrap;gap:8px;';
+            options.forEach(o => {
+                const chip = document.createElement('button');
+                chip.type = 'button';
+                chip.textContent = o.label;
+                const active = currentId === o.id;
+                chip.style.cssText = 'padding:6px 14px;border-radius:16px;font-size:13px;font-family:inherit;color:#fff;cursor:pointer;'
+                    + `border:1px solid ${active ? '#00a4dc' : '#444'};`
+                    + `background:${active ? 'rgba(0,164,220,0.2)' : 'transparent'};`;
+                chip.setAttribute('aria-pressed', active ? 'true' : 'false');
+                chip.addEventListener('click', () => onPick(o.id));
+                chips.appendChild(chip);
+            });
+            wrap.appendChild(chips);
+            return wrap;
+        }
+
+        // Checkbox list (audio / subtitle tracks): multiple choice.
+        function checkList(labelText, noteText, tracks, checked, onToggle) {
+            const wrap = document.createElement('div');
+            const title = document.createElement('div');
+            title.style.cssText = 'font-size:13px;font-weight:600;color:#fff;opacity:0.7;margin-bottom:6px;';
+            title.textContent = labelText;
+            wrap.appendChild(title);
+            tracks.forEach(s => {
+                const label = document.createElement('label');
+                label.style.cssText = 'display:flex;align-items:center;gap:8px;padding:4px 0;font-size:13px;color:#ddd;cursor:pointer;';
+                const box = document.createElement('input');
+                box.type = 'checkbox';
+                box.checked = checked.has(s.Index);
+                box.style.cssText = 'width:16px;height:16px;accent-color:#00a4dc;';
+                box.addEventListener('change', () => onToggle(s.Index, box.checked));
+                const span = document.createElement('span');
+                span.textContent = trackLabel(s);
+                label.appendChild(box);
+                label.appendChild(span);
+                wrap.appendChild(label);
+            });
+            if (noteText) {
+                const note = document.createElement('div');
+                note.style.cssText = 'font-size:12px;color:#888;margin-top:4px;';
+                note.textContent = noteText;
+                wrap.appendChild(note);
+            }
             return wrap;
         }
 
@@ -1243,62 +1359,61 @@
                     }));
                 }
 
-                if (audios.length > 1) {
-                    section.appendChild(selectRow('Audio track', audios.map(a => ({
-                        value: a.Index, label: trackLabel(a),
-                    })), selectedAudioStreamIndex, (v) => {
-                        selectedAudioStreamIndex = v;
-                        const picked = audios.find(a => a.Index === v);
-                        selectedAudioLanguage = picked ? (picked.Language || picked.DisplayLanguage || null) : null;
+                // Container first: it constrains what the server can mux.
+                section.appendChild(chipRow('Format', [
+                    { id: 'mp4', label: 'MP4 · plays everywhere' },
+                    { id: 'mkv', label: 'MKV · styled subs + chapters' },
+                ], selectedContainer, (id) => {
+                    selectedContainer = id;
+                    render();
+                    refreshTiers();
+                }));
+
+                if (audios.length > 0) {
+                    const audioNote = audios.length > 1
+                        ? 'First checked goes in the download; the rest queue as extra full files.'
+                        : null;
+                    section.appendChild(checkList('Audio tracks', audioNote, audios, selectedAudioChecked, (idx, on) => {
+                        if (on) selectedAudioChecked.add(idx);
+                        else selectedAudioChecked.delete(idx);
+                        const primary = primaryChecked(audios, selectedAudioChecked);
+                        selectedAudioLanguage = primary ? (primary.Language || primary.DisplayLanguage || null) : null;
                     }));
                 }
 
                 if (subs.length > 0) {
-                    const modes = [
+                    const modeWrap = chipRow('Subtitles', [
                         { id: 'none', label: 'No subtitles' },
                         { id: 'embed', label: 'Soft subs' },
                         { id: 'burn', label: 'Burn in' },
-                    ];
-                    const modeWrap = document.createElement('div');
-                    const modeTitle = document.createElement('div');
-                    modeTitle.style.cssText = 'font-size:13px;font-weight:600;color:#fff;opacity:0.7;margin-bottom:6px;';
-                    modeTitle.textContent = 'Subtitles';
-                    modeWrap.appendChild(modeTitle);
-                    const chips = document.createElement('div');
-                    chips.style.cssText = 'display:flex;flex-wrap:wrap;gap:8px;';
-                    modes.forEach(m => {
-                        const chip = document.createElement('button');
-                        chip.type = 'button';
-                        chip.textContent = m.label;
-                        const active = selectedSubtitleMode === m.id;
-                        chip.style.cssText = 'padding:6px 14px;border-radius:16px;font-size:13px;font-family:inherit;color:#fff;cursor:pointer;'
-                            + `border:1px solid ${active ? '#00a4dc' : '#444'};`
-                            + `background:${active ? 'rgba(0,164,220,0.2)' : 'transparent'};`;
-                        chip.setAttribute('aria-pressed', active ? 'true' : 'false');
-                        chip.addEventListener('click', () => {
-                            selectedSubtitleMode = m.id;
-                            if (m.id === 'none') selectedSubtitleStreamIndex = null;
-                            else if (selectedSubtitleStreamIndex == null && subs.length > 0) {
-                                selectedSubtitleStreamIndex = subs[0].Index;
-                                selectedSubtitleLanguage = subs[0].Language || null;
-                            }
-                            render();
-                        });
-                        chips.appendChild(chip);
+                    ], selectedSubtitleMode, (id) => {
+                        selectedSubtitleMode = id;
+                        if (id === 'none') {
+                            selectedSubtitleChecked = new Set();
+                            selectedSubtitleLanguage = null;
+                        } else if (selectedSubtitleChecked.size === 0) {
+                            selectedSubtitleChecked = new Set([subs[0].Index]);
+                            selectedSubtitleLanguage = subs[0].Language || subs[0].DisplayLanguage || null;
+                        }
+                        render();
                     });
-                    modeWrap.appendChild(chips);
-                    if (selectedSubtitleMode !== 'none') {
-                        const row = selectRow('', subs.map(s => ({
-                            value: s.Index, label: trackLabel(s),
-                        })), selectedSubtitleStreamIndex, (v) => {
-                            selectedSubtitleStreamIndex = v;
-                            const picked = subs.find(s => s.Index === v);
-                            selectedSubtitleLanguage = picked ? (picked.Language || picked.DisplayLanguage || null) : null;
-                        });
-                        row.firstChild.remove(); // drop the empty title, keep the select
-                        modeWrap.appendChild(row);
-                    }
                     section.appendChild(modeWrap);
+                    if (selectedSubtitleMode !== 'none') {
+                        // Burn-in can only ever carry ONE track; the rest ride along as
+                        // sidecars. Embed puts the first checked track in the file.
+                        const note = selectedSubtitleMode === 'burn'
+                            ? 'Burn-in uses the first checked track only; the rest save as .srt sidecars.'
+                            : 'First checked is embedded in the file; the rest save as .srt sidecars.';
+                        section.appendChild(checkList('', note, subs, selectedSubtitleChecked, (idx, on) => {
+                            const next = new Set(selectedSubtitleChecked);
+                            if (on) next.add(idx);
+                            else next.delete(idx);
+                            selectedSubtitleChecked = next;
+                            const primary = primaryChecked(subs, next);
+                            selectedSubtitleLanguage = primary
+                                ? (primary.Language || primary.DisplayLanguage || null) : null;
+                        }));
+                    }
                 }
             };
             render();
@@ -1346,17 +1461,74 @@
             tierList.textContent = '';
             const tiers = sheetTiers();
             const factor = videoCodecFactor(selectedVideoCodec);
+            // Recommended = best quality at or under the phone sweet spot (4M H.264-equiv),
+            // never exceeding the source. One tap for "best size for the quality".
+            const cap = Math.min(
+                currentSource && currentSource.Bitrate ? currentSource.Bitrate : Infinity,
+                4_000_000);
+            let recIdx = tiers.length - 1;
+            tiers.forEach((t, i) => {
+                if (scaleBitrate(t.bitrate, factor) <= cap) recIdx = i;
+            });
 
-            for (const tier of tiers) {
+            for (const [ti, tier] of tiers.entries()) {
                 const bitrate = scaleBitrate(tier.bitrate, factor);
                 const sizeHint = durationSeconds > 0 ? ` · ${formatSize(bitrate * durationSeconds / 8)}` : '';
-                const btn = makeMenuItem('video_settings', `${tier.resolution} · ${formatBitrate(bitrate)}${sizeHint}`, () => {
+                const star = ti === recIdx ? '★ ' : '';
+                const btn = makeMenuItem('video_settings', `${star}${tier.resolution} · ${formatBitrate(bitrate)}${sizeHint}`, () => {
                     scrim.remove();
-                    if (batchSeason) {
-                        queueSeason(item.SeasonId, tier, bitrate, videoCodec, audioCodec);
+                    if (batchOpt && batchOpt.episodes) {
+                        // Whole-selection batch: one folder picker, then every episode
+                        // streams to Series/Season NN/ subfolders.
+                        getApiClient(0, 5, async (client) => {
+                            const token = client.accessToken();
+                            const baseUrl = client.serverAddress() || window.location.origin;
+                            const dirHandle = await pickBatchDirectory();
+                            if (!dirHandle) return;
+                            enqueueEpisodeBatch(client, token, baseUrl, dirHandle,
+                                batchOpt.episodes, tier, bitrate, videoCodec, audioCodec,
+                                batchOpt.seriesTitle);
+                        });
+                    } else if (batchSeason) {
+                        getApiClient(0, 5, async (client) => {
+                            const token = client.accessToken();
+                            const baseUrl = client.serverAddress() || window.location.origin;
+                            let eps = [];
+                            try {
+                                const res = await client.getItems(client.getCurrentUserId(), {
+                                    ParentId: item.SeasonId,
+                                    IncludeItemTypes: 'Episode',
+                                    Fields: 'MediaSources,ParentIndexNumber,IndexNumber,Name,SeriesName,RunTimeTicks,ProductionYear,Type',
+                                    SortBy: 'ParentIndexNumber,IndexNumber',
+                                    SortOrder: 'Ascending',
+                                    Recursive: true,
+                                });
+                                eps = (res && res.Items) || [];
+                            } catch (err) {
+                                console.error('[TranscodeDownloader] season fetch failed:', err);
+                                showTransientNotice(t('DownloadFailed'));
+                                return;
+                            }
+                            if (eps.length === 0) {
+                                showTransientNotice(t('NoTranscodeOptions'));
+                                return;
+                            }
+                            const dirHandle = await pickBatchDirectory();
+                            if (!dirHandle) return;
+                            enqueueEpisodeBatch(client, token, baseUrl, dirHandle, eps,
+                                tier, bitrate, videoCodec, audioCodec, item.SeriesName);
+                        });
                     } else {
-                        onTranscodeMenuClick(tier, bitrate, item.Id || itemId, item,
-                            resolveEpisodeTracks(item, currentSource));
+                        const tracks = resolveEpisodeTracks(item, currentSource);
+                        const streams = (currentSource && currentSource.MediaStreams) || [];
+                        const audios = streams.filter(s => s.Type === 'Audio');
+                        const subs = streams.filter(s => s.Type === 'Subtitle');
+                        const extraAudios = audios.filter(a =>
+                            selectedAudioChecked.has(a.Index) && a.Index !== tracks.audioStreamIndex);
+                        const extraSubs = selectedSubtitleMode === 'none' ? [] : subs.filter(s =>
+                            selectedSubtitleChecked.has(s.Index) && s.Index !== tracks.subtitleStreamIndex);
+                        onTranscodeMenuClick(tier, bitrate, item.Id || itemId, item, tracks,
+                            { audios: extraAudios, subs: extraSubs });
                     }
                 });
                 tierList.appendChild(btn);
@@ -1380,7 +1552,12 @@
         const refreshTiers = () => {
             renderTiers();
             const risky = selectedVideoCodec === 'hevc' || selectedAudioCodec === 'opus';
-            appleWarn.style.display = (isApplePlayer() && risky) ? '' : 'none';
+            const mkvWarn = selectedContainer === 'mkv' && isApplePlayer();
+            appleWarn.style.display = (isApplePlayer() && (risky || selectedContainer === 'mkv')) ? '' : 'none';
+            if (appleWarn.style.display !== 'none') {
+                appleWarn.textContent = t('AppleCodecWarning')
+                    + (mkvWarn ? ' MKV needs VLC or Infuse on Apple devices.' : '');
+            }
         };
 
         // Only offered when the server told us what it can encode; otherwise the flow stays
@@ -1403,7 +1580,7 @@
         // at that tier/codec with the same track languages. Batch rows use in-memory
         // downloads (no save picker can open for 12 files from one tap).
         let batchSeason = false;
-        if (item.Type === 'Episode' && item.SeasonId && !isAndroidAppWebView()) {
+        if (item.Type === 'Episode' && item.SeasonId && !isAndroidAppWebView() && !batchOpt) {
             const batchBtn = makeMenuItem('video_library', 'Queue season…', () => {
                 batchSeason = true;
                 batchBtn.style.opacity = '0.5';
@@ -1416,76 +1593,244 @@
         sheet.appendChild(tierList);
     }
 
-    function queueSeason(seasonId, tier, bitrate, videoCodec, audioCodec) {
+    // Batch enqueue with proper folders: each episode lands in
+    // <chosen dir>/<SeriesName>/Season NN/<file>, mirroring Jellyfin's library layout.
+    // One directory picker covers the whole batch; per-episode files stream to disk.
+    async function enqueueEpisodeBatch(client, token, baseUrl, dirHandle, episodes, tier, bitrate, videoCodec, audioCodec, seriesTitle) {
+        let queued = 0;
+        for (const ep of episodes) {
+            const sources = ep.MediaSources || [];
+            if (sources.length === 0) continue;
+            const src = sources[0];
+            const tracks = resolveEpisodeTracks(ep, src);
+            const spec = {
+                baseUrl, itemId: ep.Id, tier, bitrate, item: ep, videoCodec, audioCodec,
+                container: selectedContainer,
+                mediaSourceId: tracks.mediaSourceId,
+                audioStreamIndex: tracks.audioStreamIndex,
+                subtitleStreamIndex: tracks.subtitleStreamIndex,
+                subtitleMethod: tracks.subtitleMethod,
+            };
+            const parts = buildDownloadParts(spec);
+            const seasonNo = Number.isFinite(Number(ep.ParentIndexNumber))
+                ? String(ep.ParentIndexNumber).padStart(2, '0') : '??';
+            enqueue({
+                id: `${ep.Id}-${Date.now()}-${queued}`,
+                spec,
+                token,
+                fileHandle: null,
+                dirHandle,
+                dirPath: [ep.SeriesName || seriesTitle || 'Unknown series', `Season ${seasonNo}`],
+                filename: parts.filename,
+                estimatedBytes: parts.estimatedBytes,
+                url: parts.url,
+                stopUrl: parts.stopUrl,
+                videoCodec: parts.videoCodec,
+                audioCodec: parts.audioCodec,
+                mimeType: parts.mimeType,
+                codecLabel: parts.codecLabel,
+                receivedBytes: 0,
+                abortController: null,
+                status: 'waiting',
+            });
+            queued += 1;
+        }
+        showTransientNotice(`Queued ${queued} episode${queued === 1 ? '' : 's'}.`);
+    }
+
+    async function pickBatchDirectory() {
+        if (typeof window.showDirectoryPicker !== 'function') {
+            showTransientNotice('This browser cannot pick folders — try Chrome or Edge.');
+            return null;
+        }
+        try {
+            return await window.showDirectoryPicker();
+        } catch (err) {
+            if (!(err && err.name === 'AbortError')) {
+                console.warn('[TranscodeDownloader] directory picker failed:', err);
+                showTransientNotice(t('DownloadFailed'));
+            }
+            return null;
+        }
+    }
+
+    function queueSeasonDir(client, token, baseUrl, seasonId, seriesTitle, tier, bitrate, videoCodec, audioCodec) {
+        client.getItems(client.getCurrentUserId(), {
+            ParentId: seasonId,
+            IncludeItemTypes: 'Episode',
+            Fields: 'MediaSources,ParentIndexNumber,IndexNumber,Name,SeriesName,RunTimeTicks,ProductionYear,Type',
+            SortBy: 'ParentIndexNumber,IndexNumber',
+            SortOrder: 'Ascending',
+            Recursive: true,
+        }).then(async (res) => {
+            const episodes = (res && res.Items) || [];
+            if (episodes.length === 0) {
+                showTransientNotice(t('NoTranscodeOptions'));
+                return;
+            }
+            const dirHandle = await pickBatchDirectory();
+            if (!dirHandle) return;
+            enqueueEpisodeBatch(client, token, baseUrl, dirHandle, episodes, tier, bitrate, videoCodec, audioCodec, seriesTitle);
+        }).catch((err) => {
+            console.error('[TranscodeDownloader] season fetch failed:', err);
+            showTransientNotice(t('DownloadFailed'));
+        });
+    }
+
+    // Series / season entry point: checklist of seasons (with counts), then the
+    // normal quality sheet; the picked tier queues every episode of every checked
+    // season into Series/Season NN/ folders.
+    function openBatchSheet(item) {
         getApiClient(0, 5, async (client) => {
-            const token = client.accessToken();
-            const baseUrl = client.serverAddress() || window.location.origin;
+            const userId = client.getCurrentUserId();
+            let seasons = [];
+            if (item.Type === 'Season') {
+                seasons = [{ Id: item.Id, Name: item.Name, IndexNumber: item.IndexNumber }];
+            } else {
+                try {
+                    const res = await client.getItems(userId, {
+                        ParentId: item.Id,
+                        IncludeItemTypes: 'Season',
+                        Fields: 'IndexNumber,Name',
+                        SortBy: 'SortName',
+                        SortOrder: 'Ascending',
+                        Recursive: true,
+                    });
+                    seasons = (res && res.Items) || [];
+                } catch (err) {
+                    console.error('[TranscodeDownloader] seasons fetch failed:', err);
+                    showTransientNotice(t('DownloadFailed'));
+                    return;
+                }
+            }
+            if (seasons.length === 0) {
+                showTransientNotice(t('NoTranscodeOptions'));
+                return;
+            }
             let episodes = [];
             try {
-                const res = await client.getItems(client.getCurrentUserId(), {
-                    ParentId: seasonId,
+                const res = await client.getItems(userId, {
+                    ParentId: item.Id,
                     IncludeItemTypes: 'Episode',
-                    Fields: 'MediaSources,ParentIndexNumber,IndexNumber,Name,SeriesName,RunTimeTicks,ProductionYear,Type',
+                    Fields: 'MediaSources,ParentIndexNumber,IndexNumber,Name,SeriesName,SeasonId,SeasonName,RunTimeTicks,ProductionYear,Type',
                     SortBy: 'ParentIndexNumber,IndexNumber',
                     SortOrder: 'Ascending',
                     Recursive: true,
                 });
                 episodes = (res && res.Items) || [];
             } catch (err) {
-                console.error('[TranscodeDownloader] season fetch failed:', err);
+                console.error('[TranscodeDownloader] episodes fetch failed:', err);
                 showTransientNotice(t('DownloadFailed'));
                 return;
             }
-            if (episodes.length === 0) {
-                showTransientNotice(t('NoTranscodeOptions'));
-                return;
-            }
-            let queued = 0;
-            for (const ep of episodes) {
-                const sources = ep.MediaSources || [];
-                if (sources.length === 0) continue;
-                const src = sources[0];
-                const tracks = resolveEpisodeTracks(ep, src);
-                const spec = {
-                    baseUrl, itemId: ep.Id, tier, bitrate, item: ep, videoCodec, audioCodec,
-                    mediaSourceId: tracks.mediaSourceId,
-                    audioStreamIndex: tracks.audioStreamIndex,
-                    subtitleStreamIndex: tracks.subtitleStreamIndex,
-                    subtitleMethod: tracks.subtitleMethod,
-                };
-                addToQueue(token, spec, null);
-                queued += 1;
-            }
-            showTransientNotice(`Queued ${queued} episode${queued === 1 ? '' : 's'}.`);
+            const bySeason = {};
+            episodes.forEach(ep => {
+                const key = ep.SeasonId || (item.Type === 'Season' ? item.Id : 'unknown');
+                (bySeason[key] = bySeason[key] || []).push(ep);
+            });
+
+            const scrim = document.createElement('div');
+            scrim.style.cssText = 'position:fixed;inset:0;z-index:10000;display:flex;align-items:flex-end;justify-content:center;background:rgba(0,0,0,0.5);';
+            scrim.addEventListener('click', (e) => { if (e.target === scrim) scrim.remove(); });
+            const sheet = document.createElement('div');
+            sheet.style.cssText = 'background:#1a1a1a;border-radius:12px 12px 0 0;width:100%;max-width:600px;max-height:80vh;overflow-y:auto;padding:16px 20px 24px;color:#fff;';
+            const header = document.createElement('div');
+            header.style.cssText = 'font-size:15px;font-weight:600;margin-bottom:4px;';
+            header.textContent = item.Type === 'Season' ? `Download season (Transcode…)` : `Download series (Transcode…)`;
+            sheet.appendChild(header);
+            const sub = document.createElement('div');
+            sub.style.cssText = 'font-size:12px;color:#888;margin-bottom:12px;';
+            sub.textContent = item.Name || '';
+            sheet.appendChild(sub);
+
+            const checked = new Set(seasons.map(s => s.Id));
+            seasons.forEach(s => {
+                const count = (bySeason[s.Id] || []).length;
+                const label = document.createElement('label');
+                label.style.cssText = 'display:flex;align-items:center;gap:8px;padding:6px 0;font-size:14px;cursor:pointer;';
+                const box = document.createElement('input');
+                box.type = 'checkbox';
+                box.checked = true;
+                box.style.cssText = 'width:16px;height:16px;accent-color:#00a4dc;';
+                box.addEventListener('change', () => {
+                    if (box.checked) checked.add(s.Id);
+                    else checked.delete(s.Id);
+                });
+                const span = document.createElement('span');
+                span.textContent = `${s.Name || 'Season'} · ${count} episode${count === 1 ? '' : 's'}`;
+                label.appendChild(box);
+                label.appendChild(span);
+                sheet.appendChild(label);
+            });
+
+            const go = document.createElement('button');
+            go.type = 'button';
+            go.textContent = 'Choose quality…';
+            go.style.cssText = 'margin-top:12px;width:100%;padding:10px;border-radius:6px;border:1px solid #00a4dc;background:rgba(0,164,220,0.2);color:#fff;font-size:14px;cursor:pointer;';
+            go.addEventListener('click', () => {
+                const chosen = episodes.filter(ep =>
+                    checked.has(ep.SeasonId || (item.Type === 'Season' ? item.Id : 'unknown')));
+                if (chosen.length === 0) {
+                    showTransientNotice(t('NoTranscodeOptions'));
+                    return;
+                }
+                scrim.remove();
+                // Reuse the normal quality sheet against the first episode; the tier
+                // click fans out to the whole selection with folder-organized output.
+                showQualitySheet(chosen[0].Id, {
+                    title: `${item.Name} · ${chosen.length} episodes`,
+                    episodes: chosen,
+                    seriesTitle: item.Type === 'Series' ? item.Name : (chosen[0].SeriesName || item.SeriesName),
+                });
+            });
+            sheet.appendChild(go);
+            scrim.appendChild(sheet);
+            document.body.appendChild(scrim);
         });
     }
 
     // Current sheet's track choices. Reset on every sheet open; the click handler copies
     // them into the entry spec so retries, restores and season batches reuse them.
     let selectedMediaSourceId = null;
-    let selectedAudioStreamIndex = null; // null = server default
     let selectedSubtitleMode = 'burn'; // 'burn' | 'embed' | 'none'
-    let selectedSubtitleStreamIndex = null; // null = none
+    // Checklists hold stream Index values; the first checked track (in track order)
+    // is the primary that goes into the transcode. The rest become sidecars
+    // (subtitles) or extra full downloads (audio).
+    let selectedAudioChecked = new Set();
+    let selectedSubtitleChecked = new Set();
     let selectedAudioLanguage = null;
     let selectedSubtitleLanguage = null;
 
     function resetTrackSelections() {
         selectedMediaSourceId = null;
-        selectedAudioStreamIndex = null;
         selectedSubtitleMode = 'burn';
-        selectedSubtitleStreamIndex = null;
+        selectedAudioChecked = new Set();
+        selectedSubtitleChecked = new Set();
         selectedAudioLanguage = null;
         selectedSubtitleLanguage = null;
+        selectedContainer = DEFAULT_CONTAINER;
+    }
+
+    // First checked track in track order = primary. Everything else is an extra.
+    function primaryChecked(tracks, checked) {
+        const t = tracks.find(s => checked.has(s.Index));
+        return t || null;
     }
 
     // The save picker must open inside the tier-click gesture; browsers reject it from
     // async queue processing later. No picker (Firefox, insecure context) = Blob fallback.
-    async function pickSaveFile(suggestedName) {
+    async function pickSaveFile(suggestedName, container) {
         if (typeof window.showSaveFilePicker !== 'function') return null;
         try {
+            const ext = container === 'mkv' ? 'mkv' : 'mp4';
             return await window.showSaveFilePicker({
                 suggestedName,
-                types: [{ description: 'MP4 video', accept: { 'video/mp4': ['.mp4'] } }],
+                types: [{
+                    description: ext === 'mkv' ? 'MKV video' : 'MP4 video',
+                    accept: ext === 'mkv'
+                        ? { 'video/x-matroska': ['.mkv'] }
+                        : { 'video/mp4': ['.mp4'] },
+                }],
             });
         } catch (err) {
             // AbortError = user cancelled the dialog: not a failure, just stop.
@@ -1530,7 +1875,47 @@
         };
     }
 
-    function onTranscodeMenuClick(tier, bitrate, itemId, item, tracks) {
+    // Checked-but-not-primary tracks ride along: extra audios become their own full
+    // downloads (one transcode carries exactly one audio), extra subs become tiny
+    // .srt sidecars fetched straight from the server (no transcode needed).
+    function queueExtraTracks(token, spec, extras) {
+        if (!extras) return;
+        for (const a of extras.audios || []) {
+            const lang = (a.Language || a.DisplayLanguage || 'und').toLowerCase();
+            const exSpec = {
+                baseUrl: spec.baseUrl, itemId: spec.itemId, tier: spec.tier,
+                bitrate: spec.bitrate, item: spec.item, videoCodec: spec.videoCodec,
+                audioCodec: spec.audioCodec, container: spec.container,
+                nameTag: lang,
+                mediaSourceId: spec.mediaSourceId,
+                audioStreamIndex: a.Index,
+                subtitleStreamIndex: spec.subtitleStreamIndex,
+                subtitleMethod: spec.subtitleMethod,
+            };
+            addToQueue(token, exSpec, null);
+        }
+        const parts = buildDownloadParts(spec);
+        const base = parts.filename.replace(/\.(mp4|mkv)$/i, '');
+        for (const s of extras.subs || []) {
+            const lang = (s.Language || s.DisplayLanguage || 'und').toLowerCase();
+            enqueue({
+                id: `${spec.itemId}-sub${s.Index}-${Date.now()}`,
+                kind: 'subtitle',
+                spec: null,
+                token,
+                fileHandle: null,
+                filename: `${base}.${lang}.srt`,
+                estimatedBytes: 0,
+                url: `${spec.baseUrl}/Videos/${spec.itemId}/${spec.mediaSourceId}/Subtitles/${s.Index}/Stream.srt`,
+                stopUrl: null,
+                receivedBytes: 0,
+                abortController: null,
+                status: 'waiting',
+            });
+        }
+    }
+
+    function onTranscodeMenuClick(tier, bitrate, itemId, item, tracks, extras) {
         if (!item) return;
         // Captured now: the sheet is gone, but the selection must not drift before the
         // ApiClient callback runs. Track choices are baked into the spec at click time.
@@ -1538,22 +1923,21 @@
         const audioCodec = selectedAudioCodec;
         const spec = {
             baseUrl: null, itemId, tier, bitrate, item, videoCodec, audioCodec,
+            container: selectedContainer,
             mediaSourceId: tracks && tracks.mediaSourceId != null ? tracks.mediaSourceId : selectedMediaSourceId,
-            audioStreamIndex: tracks ? tracks.audioStreamIndex : selectedAudioStreamIndex,
-            subtitleStreamIndex: tracks ? tracks.subtitleStreamIndex : selectedSubtitleStreamIndex,
-            subtitleMethod: tracks
-                ? tracks.subtitleMethod
-                : (selectedSubtitleMode === 'burn' ? 'Encode'
-                    : selectedSubtitleMode === 'embed' ? 'Embed' : null),
+            audioStreamIndex: tracks ? tracks.audioStreamIndex : null,
+            subtitleStreamIndex: tracks ? tracks.subtitleStreamIndex : null,
+            subtitleMethod: tracks ? tracks.subtitleMethod : null,
         };
         getApiClient(0, 5, async (client) => {
             const token = client.accessToken();
             const baseUrl = client.serverAddress() || window.location.origin;
             spec.baseUrl = baseUrl;
             const suggestedName = buildDownloadParts(spec).filename;
-            const fileHandle = await pickSaveFile(suggestedName);
+            const fileHandle = await pickSaveFile(suggestedName, spec.container);
             if (fileHandle === 'cancelled') return;
             addToQueue(token, spec, fileHandle);
+            queueExtraTracks(token, spec, extras);
         });
     }
 
@@ -1583,31 +1967,33 @@
                 ? `&SubtitleStreamIndex=${spec.subtitleStreamIndex}&SubtitleMethod=${spec.subtitleMethod}` : '')
             + `&allowVideoStreamCopy=false&allowAudioStreamCopy=false&Static=false`
             + `&PlaySessionId=${playSessionId}&DeviceId=${encodeURIComponent(deviceId)}`;
-        const url = `${baseUrl}/Videos/${itemId}/stream.mp4?${query}`;
+        const url = `${baseUrl}/Videos/${itemId}/stream.${ext}?${query}`;
         const stopUrl = buildStopUrl(baseUrl, deviceId, playSessionId);
 
         const videoTag = codecTag(VIDEO_CODECS, videoCodec);
         const audioTag = codecTag(AUDIO_CODECS, audioCodec);
-        const suffix = ` [${videoTag} ${formatBitrate(bitrate).replace(' ', '')} ${audioTag}]`;
+        const ext = spec.container === 'mkv' ? 'mkv' : 'mp4';
+        const suffix = ` [${videoTag} ${formatBitrate(bitrate).replace(' ', '')} ${audioTag}${spec.nameTag ? ' ' + spec.nameTag : ''}]`;
 
         const pad = (n) => (Number.isFinite(Number(n)) ? String(n).padStart(2, '0') : '??');
         let filename;
         if (item.Type === 'Movie') {
-            filename = `${item.Name} (${item.ProductionYear || '????'})${suffix}.mp4`;
+            filename = `${item.Name} (${item.ProductionYear || '????'})${suffix}.${ext}`;
         } else if (item.Type === 'Episode') {
-            filename = `${item.SeriesName} S${pad(item.ParentIndexNumber)}E${pad(item.IndexNumber)} - ${item.Name}${suffix}.mp4`;
+            filename = `${item.SeriesName} S${pad(item.ParentIndexNumber)}E${pad(item.IndexNumber)} - ${item.Name}${suffix}.${ext}`;
         } else {
-            filename = `download${suffix}.mp4`;
+            filename = `download${suffix}.${ext}`;
         }
-        filename = sanitizeFilename(filename, `download${suffix}.mp4`);
+        filename = sanitizeFilename(filename, `download${suffix}.${ext}`);
 
         const durationSeconds = item.RunTimeTicks ? item.RunTimeTicks / 10_000_000 : 0;
         const estimatedBytes = durationSeconds > 0 ? (bitrate * durationSeconds) / 8 : 0;
 
         return {
             url, query, stopUrl, filename, estimatedBytes, deviceId, playSessionId,
-            videoCodec, audioCodec,
-            codecLabel: `${videoTag} · ${formatBitrate(bitrate)} · ${audioTag}`,
+            videoCodec, audioCodec, container: ext,
+            mimeType: ext === 'mkv' ? 'video/x-matroska' : 'video/mp4',
+            codecLabel: `${videoTag} · ${formatBitrate(bitrate)} · ${audioTag} · ${ext.toUpperCase()}`,
         };
     }
 
@@ -1620,6 +2006,7 @@
         if (isAndroidAppWebView()) {
             const handoff = `${spec.baseUrl}/TranscodeDownloader/Download/${spec.itemId}`
                 + `?${parts.query}&filename=${encodeURIComponent(parts.filename)}`
+                + `&container=${parts.container}`
                 + `&ApiKey=${encodeURIComponent(token)}`;
             handOffToBrowser(handoff, spec.baseUrl, parts.deviceId, parts.playSessionId);
             return;
@@ -1636,6 +2023,7 @@
             stopUrl: parts.stopUrl,
             videoCodec: parts.videoCodec,
             audioCodec: parts.audioCodec,
+            mimeType: parts.mimeType,
             codecLabel: parts.codecLabel,
             receivedBytes: 0,
             abortController: null,
@@ -1648,8 +2036,29 @@
     document.addEventListener('contextmenu', recordContextMenuTarget, true);
 
     const _menuObserver = new MutationObserver(() => {
+        if (document.querySelector('[data-id^="qd-"]')) return;
         const downloadBtn = document.querySelector('.actionSheetMenuItem[data-id="download"]');
-        if (downloadBtn) injectMenuItems(downloadBtn);
+        if (downloadBtn) {
+            injectMenuItems(downloadBtn);
+            return;
+        }
+        // Series and season sheets carry no Download entry of their own — offer a
+        // batch entry anchored at the end of the sheet instead.
+        const itemId = takeContextMenuItemId() || extractItemId(window.location.hash);
+        if (!itemId) return;
+        fetchItemMetadata(itemId).then(item => {
+            if (!item || document.querySelector('[data-id^="qd-"]')) return;
+            if (item.Type !== 'Series' && item.Type !== 'Season') return;
+            const sheet = document.querySelector('.actionSheet');
+            if (!sheet || !document.contains(sheet)) return;
+            const label = item.Type === 'Series' ? 'Download series (Transcode…)' : 'Download season (Transcode…)';
+            const btn = makeMenuItem('video_library', label, () => {
+                closeActiveSheet();
+                openBatchSheet(item);
+            });
+            btn.setAttribute('data-id', item.Type === 'Series' ? 'qd-series' : 'qd-season');
+            sheet.appendChild(btn);
+        });
     });
     _menuObserver.observe(document.body, { childList: true, subtree: true });
 
