@@ -1837,9 +1837,13 @@
             const cap = Math.min(
                 currentSource && currentSource.Bitrate ? currentSource.Bitrate : Infinity,
                 4_000_000);
+            const _audList = (currentSource && currentSource.MediaStreams || []).filter(x => x.Type === 'Audio');
+            const _aPick = primaryChecked(_audList, selectedAudioChecked)
+                || _audList.find(x => x.IsDefault) || _audList[0] || null;
+            const _aBr = audioBitrateFor(currentSource, _aPick && _aPick.Index);
             let recIdx = tiers.length - 1;
             for (let i = 0; i < tiers.length; i++) {
-                if (scaleBitrate(tiers[i].bitrate, factor) <= cap) { recIdx = i; break; }
+                if (scaleBitrate(tiers[i].bitrate, factor) + _aBr <= cap) { recIdx = i; break; }
             }
             const srcVideo = currentSource && (currentSource.MediaStreams || []).find(s => s.Type === 'Video');
             const srcCodec = srcVideo && (srcVideo.Codec || '');
@@ -2521,6 +2525,17 @@
         return t || null;
     }
 
+    // Estimated audio bitrate for size math: the selected track's own bitrate when
+    // the server reports one, else 256000 — matching this server's observed
+    // transcodes (libfdk_aac stereo). The old video-only estimate is what made
+    // low rungs look ~2x smaller than the real file.
+    function audioBitrateFor(src, streamIndex) {
+        const streams = (src && src.MediaStreams) || [];
+        const t = streams.find(s => s.Type === 'Audio' && s.Index === streamIndex);
+        if (t && typeof t.BitRate === 'number' && t.BitRate > 0) return t.BitRate;
+        return 256000;
+    }
+
     // The save picker must open inside the tier-click gesture; browsers reject it from
     // async queue processing later. No picker (Firefox, insecure context) = Blob fallback.
     async function pickSaveFile(suggestedName, container) {
@@ -2748,7 +2763,11 @@
         filename = sanitizeFilename(filename, `download${suffix}.${ext}`);
 
         const durationSeconds = item.RunTimeTicks ? item.RunTimeTicks / 10_000_000 : 0;
-        const estimatedBytes = durationSeconds > 0 ? (bitrate * durationSeconds) / 8 : 0;
+        const aTrack = (mediaSource.MediaStreams || [])
+            .find(x => x.Type === 'Audio' && x.Index === spec.audioStreamIndex);
+        const audioBitrate = (aTrack && typeof aTrack.BitRate === 'number' && aTrack.BitRate > 0)
+            ? aTrack.BitRate : 256000;
+        const estimatedBytes = durationSeconds > 0 ? ((bitrate + audioBitrate) * durationSeconds) / 8 : 0;
 
         return {
             url, query, stopUrl, filename, estimatedBytes, deviceId, playSessionId,
