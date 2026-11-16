@@ -9,6 +9,14 @@
     "imageUrl": "https://raw.githubusercontent.com/ph15ch/Jellyfin-Transcode-Downloader/main/logo.png",
     "versions": [
       {
+        "version": "1.6.3.0",
+        "changelog": "Audible failures on the download path",
+        "targetAbi": "12.4.0.0",
+        "sourceUrl": "https://github.com/BlackPool25/Jellyfin-Transcode-Downloader/releases/download/v1.6.3/jellyfin-transcode-downloader_1.6.3.zip",
+        "checksum": "6f9d442e70158ca7633ec78c9f49af2f",
+        "timestamp": "2026-11-16T07:10:45Z"
+      },
+      {
         "version": "1.6.2.0",
         "changelog": "Android handoff robustness + picker failure notices",
         "targetAbi": "12.4.0.0",
