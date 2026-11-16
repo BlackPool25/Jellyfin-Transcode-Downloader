@@ -62,7 +62,7 @@ window.addEventListener('error', e => errors.push('window.onerror: ' + (e.messag
 const origConsoleError = window.console.error;
 window.console.error = (...a) => { errors.push('console.error: ' + a.join(' ')); origConsoleError(...a); };
 
-const src = fs.readFileSync(require('path').join(__dirname, '..', 'web', 'plugin.js'), 'utf8');
+const src = fs.readFileSync('/home/shreyas/projects/Jellyfin-Transcode-Downloader/web/plugin.js', 'utf8');
 try {
     dom.window.eval(src);
     console.log('EVAL OK — plugin loaded, no throw');

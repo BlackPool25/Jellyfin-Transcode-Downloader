@@ -16,5 +16,6 @@
     "BrowserHandoffHint": "The Jellyfin Android app cannot save downloads itself, so this opens in your browser with the real filename.",
     "BrowserHandoffStarted": "Handed to your browser — check its downloads.",
     "BrowserHandoffFailed": "Could not open your browser.",
-    "AppleCodecWarning": "Apple players cannot play HEVC videos tagged hev1, and ignore Opus audio in MP4. Pick H.264 + AAC for iPhone/iPad."
+    "AppleCodecWarning": "Apple players cannot play HEVC videos tagged hev1, and ignore Opus audio in MP4. Pick H.264 + AAC for iPhone/iPad.",
+    "FilePickerFailed": "Could not open the system picker on this device."
 }

@@ -231,6 +231,7 @@
         BrowserHandoffHint: 'The Jellyfin Android app cannot save downloads itself, so this opens in your browser with the real filename.',
         BrowserHandoffStarted: 'Handed to your browser — check its downloads.',
         BrowserHandoffFailed: 'Could not open your browser.',
+        FilePickerFailed: 'Could not open the system picker on this device.',
         AppleCodecWarning: 'Apple players cannot play HEVC videos tagged hev1, and ignore Opus audio in MP4. Pick H.264 + AAC for iPhone/iPad.',
         RetryDownload: 'Retry',
     };
@@ -939,26 +940,43 @@
     // goes through the NativeInterface.downloadFiles bridge, which takes item ids and resolves
     // the URL natively. A WebView with no DownloadListener silently discards every download the
     // page starts, so the blob <a download> click below vanishes: the transcode streams to 100%,
-    // no file is written and nothing is logged. NativeShell.openUrl fires an ACTION_VIEW intent
-    // and the system browser downloads the URL instead, which is the only path that works inside
-    // the app. See issue #33.
-    function isAndroidAppWebView() {
+    // no file is written and nothing is logged.
+    //
+    // Handoff targets, in order: window.NativeShell.openUrl (jellyfin-web's facade, present on
+    // recent hosts) then window.NativeInterface.openUrl (the app's own @JavascriptInterface —
+    // always present in the Android app). Requiring only one of them matters: some hosts
+    // expose just one bridge, and demanding both silently disables the handoff.
+    function appOpenUrl(url) {
         const shell = window.NativeShell;
-        if (!shell || typeof shell.openUrl !== 'function') return false;
-        // The desktop shell defines NativeShell too and saves blobs perfectly well; NativeInterface
-        // is the Android app's own JS bridge, so it is what distinguishes the two.
-        if (!window.NativeInterface || typeof window.NativeInterface.openUrl !== 'function') return false;
-        return /Android/i.test(navigator.userAgent || '');
+        if (shell && typeof shell.openUrl === 'function') {
+            try {
+                if (shell.openUrl(url) !== false) return true;
+            } catch (_) { /* fall through to the next bridge */ }
+        }
+        const ni = window.NativeInterface;
+        if (ni && typeof ni.openUrl === 'function') {
+            try {
+                if (ni.openUrl(url) !== false) return true;
+            } catch (_) { /* fall through to failure */ }
+        }
+        return false;
     }
 
-    // Handing the URL over ends this page's involvement: the browser owns the transfer, so there
-    // is no progress, no cancel and no filename of ours — the file lands under the request path
-    // as stream.mp4 because Jellyfin's stream endpoint sends no Content-Disposition.
+    function isAndroidAppWebView() {
+        if (!/Android/i.test(navigator.userAgent || '')) return false;
+        const shell = window.NativeShell;
+        if (shell && typeof shell.openUrl === 'function') return true;
+        const ni = window.NativeInterface;
+        return !!(ni && typeof ni.openUrl === 'function');
+    }
+
+    // Handing the URL over ends this page's involvement: the browser owns the transfer, so
+    // there is no progress bar, queue or cancel button — track it in the browser's own
+    // downloads list. Routing through the plugin's Download endpoint gives the file its
+    // real name via Content-Disposition.
     function handOffToBrowser(url, baseUrl, deviceId, playSessionId) {
-        try {
-            window.NativeShell.openUrl(url);
-        } catch (err) {
-            console.error('[TranscodeDownloader] browser handoff failed:', err);
+        if (!appOpenUrl(url)) {
+            console.error('[TranscodeDownloader] browser handoff failed: no native openUrl bridge answered.');
             showTransientNotice(t('BrowserHandoffFailed'));
             return;
         }
@@ -1733,7 +1751,11 @@
             change.addEventListener('click', async () => {
                 let dir = null;
                 try { dir = await window.showDirectoryPicker(); }
-                catch (e) { return; /* cancelled */ }
+                catch (e) {
+                    if (e && e.name === 'AbortError') return; // cancelled
+                    showTransientNotice(t('FilePickerFailed'));
+                    return;
+                }
                 if (dir) {
                     savedDirHandle = dir;
                     savedDirName = dir.name || 'chosen folder';

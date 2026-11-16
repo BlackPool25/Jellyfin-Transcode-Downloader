@@ -1,7 +1,7 @@
 const fs = require('fs');
 const { JSDOM } = require('jsdom');
 
-const PLUGIN = require('path').join(__dirname, '..', 'web', 'plugin.js');
+const PLUGIN = '/home/shreyas/projects/Jellyfin-Transcode-Downloader/web/plugin.js';
 const results = [];
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
@@ -28,7 +28,7 @@ function makeEnv({ ua, nativeShell, savePicker }) {
     if (nativeShell) {
         window.__openedUrls = [];
         window.NativeShell = { openUrl: (u) => window.__openedUrls.push(u) };
-        window.NativeInterface = { openUrl: (u) => {} };
+        window.NativeInterface = { openUrl: (u) => window.__openedUrls.push(u) };
     }
     if (savePicker) {
         window.__written = [];
@@ -204,10 +204,38 @@ async function settle(env) { await sleep(500); }
         if (refErrs.length) console.log('  mob refErrs:', refErrs);
     }
 
+
+    // ---- Profile 5: app exposing ONLY NativeInterface.openUrl (no NativeShell) ----
+    {
+        const env = makeEnv({
+            ua: 'Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/126.0 Mobile Safari/537.36',
+            nativeShell: true,
+        });
+        delete env.window.NativeShell; // app exposes just the @JavascriptInterface bridge
+        const { window } = env;
+        const errors = [];
+        window.addEventListener('error', e => errors.push('onerror: ' + (e.message || e.error)));
+        const origCE = window.console.error;
+        window.console.error = (...a) => { errors.push('console.error: ' + a.join(' ')); origCE(...a); };
+        await settle(env);
+        const qd = window.document.querySelector('[data-id^="qd-"]');
+        if (qd) qd.click();
+        await sleep(600);
+        const sheet = window.document.getElementById('qd-quality-sheet');
+        const tiers = sheet ? [...sheet.querySelectorAll('button')].filter(b => /1080p|720p|480p/.test(b.textContent)) : [];
+        if (tiers[2]) tiers[2].click();
+        await sleep(200);
+        const dl = sheet ? [...sheet.querySelectorAll('button')].find(b => /^Download/.test(b.textContent)) : null;
+        if (dl) dl.click();
+        await sleep(800);
+        const refErrs = errors.filter(e => /ReferenceError|not defined|is not a function/.test(e));
+        results.push(['app: NativeInterface-only handoff works', env.window.__openedUrls.length === 1 && /TranscodeDownloader\/Download/.test(env.window.__openedUrls[0] || '')]);
+        results.push(['app: NativeInterface-only zero ReferenceErrors', refErrs.length === 0]);
+    }
+
 console.log('--- CLIENT MATRIX ---');
     let pass = 0;
     for (const [name, ok] of results) { console.log((ok ? 'PASS' : 'FAIL') + '  ' + name); if (ok) pass++; }
-
     console.log(`${pass}/${results.length} passed`);
     process.exit(pass === results.length ? 0 : 1);
 })().catch(e => { console.error('HARNESS FAIL:', e); process.exit(2); });
