@@ -9,6 +9,14 @@
     "imageUrl": "https://raw.githubusercontent.com/ph15ch/Jellyfin-Transcode-Downloader/main/logo.png",
     "versions": [
       {
+        "version": "1.6.0.0",
+        "changelog": "Saved download folder: choose a custom location once, every download goes there automatically",
+        "targetAbi": "12.4.0.0",
+        "sourceUrl": "https://github.com/BlackPool25/Jellyfin-Transcode-Downloader/releases/download/v1.6.0/jellyfin-transcode-downloader_1.6.0.zip",
+        "checksum": "0a1e088cba33d66c86ba465fa5c42f7d",
+        "timestamp": "2026-11-16T04:06:58Z"
+      },
+      {
         "version": "1.5.0.0",
         "changelog": "UI restyle + scope fixes: ElegantFin-style glass UI with stylesheet, codec toggle no longer resets tier, disabled empty-state Download button, Apple-target warnings, saved-file confirmations",
         "targetAbi": "12.4.0.0",
