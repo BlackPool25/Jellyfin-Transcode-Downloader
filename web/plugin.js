@@ -138,6 +138,15 @@
         return catalogue.find(codec => codec.id === id) || null;
     }
 
+    // Normalise codec ids for source-vs-target comparison.
+    function normCodec(c) {
+        const s = String(c || '').toLowerCase();
+        if (s === 'h264' || s === 'avc') return 'h264';
+        if (s === 'hevc' || s === 'h265' || s === 'hev1' || s === 'hvc1') return 'hevc';
+        if (s === 'av1') return 'av1';
+        return s || 'unknown';
+    }
+
     function codecTag(catalogue, id) {
         const codec = findCodec(catalogue, id);
         return codec ? codec.tag : String(id).toUpperCase();
@@ -791,18 +800,19 @@
         const list = document.getElementById('qd-queue-list');
         if (!panel || !list) return;
 
+        // Always sync rows first — even when hiding the panel — so no dead rows
+        // linger in the DOM to confuse later queries or screen readers.
+        Array.from(list.children).forEach(row => {
+            const entryId = row.dataset.entryId;
+            if (!downloadQueue.find(e => e.id === entryId)) row.remove();
+        });
+
         if (downloadQueue.length === 0) {
             panel.style.display = 'none';
             return;
         }
 
         panel.style.display = 'block';
-
-        // Remove rows for entries that are no longer in the queue
-        Array.from(list.children).forEach(row => {
-            const entryId = row.dataset.entryId;
-            if (!downloadQueue.find(e => e.id === entryId)) row.remove();
-        });
 
         // Add rows for new entries and update status of existing ones
         downloadQueue.forEach((entry, i) => {
@@ -1791,19 +1801,50 @@
         // without resetting it (only re-clamped if the scaled rung exceeds source).
         let pendingTier = null; // QUALITY_TIERS object; scaled at download time
         let tierTouched = false;
+        const ORIGINAL_TIER = { original: true, resolution: 'Original' };
         const renderTiers = () => {
             tierList.textContent = '';
             const tiers = sheetTiers();
             const factor = videoCodecFactor(selectedVideoCodec);
-            // Recommended = best quality at or under the phone sweet spot (4M H.264-equiv),
-            // never exceeding the source: the FIRST rung that fits going down, i.e. the
-            // highest quality that still counts as phone-sized.
             const cap = Math.min(
                 currentSource && currentSource.Bitrate ? currentSource.Bitrate : Infinity,
                 4_000_000);
             let recIdx = tiers.length - 1;
             for (let i = 0; i < tiers.length; i++) {
                 if (scaleBitrate(tiers[i].bitrate, factor) <= cap) { recIdx = i; break; }
+            }
+            const srcVideo = currentSource && (currentSource.MediaStreams || []).find(s => s.Type === 'Video');
+            const srcCodec = srcVideo && (srcVideo.Codec || '');
+            const srcHeight = (srcVideo && srcVideo.Height) || 0;
+            const srcBitrate = currentSource && currentSource.Bitrate ? currentSource.Bitrate : Infinity;
+
+            // Default to the untouched original when transcoding would change nothing:
+            // no burn-in, no smaller-file intent beyond what the source already is.
+            const shouldDefaultOriginal = () => {
+                if (batchOpt) return false;
+                if (selectedSubtitleChecked.size > 0) return false; // subs wanted → mux/burn path
+                if (normCodec(srcCodec) !== selectedVideoCodec) return false;
+                if (!(srcHeight > 0 && srcHeight <= 1080)) return false;
+                return srcBitrate <= cap;
+            };
+
+            // "Original" row for single downloads: the untouched source file.
+            // Hidden for batches (batch = transcode path by design).
+            if (!batchOpt) {
+                const origSelected = pendingTier && pendingTier.original;
+                if (!tierTouched && !pendingTier && shouldDefaultOriginal()) pendingTier = ORIGINAL_TIER;
+                const origSize = currentSource && currentSource.Size
+                    ? ` · ${formatSize(currentSource.Size)}` : '';
+                const origBtn = makeMenuItem('file_download', `Original file${origSize}`, () => {
+                    pendingTier = ORIGINAL_TIER;
+                    tierTouched = true;
+                    renderTiers();
+                    refreshSummary();
+                });
+                origBtn.classList.add('qd-tier');
+                if (origSelected) origBtn.classList.add('qd-tier-selected');
+                origBtn.setAttribute('aria-pressed', origSelected ? 'true' : 'false');
+                tierList.appendChild(origBtn);
             }
 
             for (const [ti, tier] of tiers.entries()) {
@@ -1873,15 +1914,21 @@
             const count = batchOpt && batchOpt.episodes ? batchOpt.episodes.length : 0;
             dlBtn.textContent = batchOpt ? `Download ${count} episode${count === 1 ? '' : 's'}`
                 : batchSeason ? 'Download season'
-                : 'Download';
+                : (pendingTier && pendingTier.original ? 'Download original' : 'Download');
             const hasTiers = sheetTiers().length > 0;
-            dlBtn.disabled = !pendingTier || !hasTiers;
-            if (!hasTiers) {
-                summaryEl.textContent = 'This source is below our smallest rung — no transcode options.';
+            dlBtn.disabled = !pendingTier || (!pendingTier.original && !hasTiers);
+            if (!hasTiers && !(pendingTier && pendingTier.original)) {
+                summaryEl.textContent = 'This source is below our smallest rung — no transcode options. Original still available above.';
                 return;
             }
             if (!pendingTier) {
                 summaryEl.textContent = 'Pick a quality above. ★ = best size-for-quality on phones (±15% VBR estimates).';
+                return;
+            }
+            if (pendingTier.original) {
+                const size = currentSource && currentSource.Size
+                    ? formatSize(currentSource.Size) : 'unknown size';
+                summaryEl.textContent = `Original file \u00b7 ${size} \u00b7 no re-encode, all tracks \u00b7 Saves via browser download.`;
                 return;
             }
             const bitrate = scaleBitrate(pendingTier.bitrate, videoCodecFactor(selectedVideoCodec));
@@ -1892,12 +1939,60 @@
             else if (batchOpt || batchSeason) where = 'Saves into a folder you pick (Series/Season NN/).';
             else if (typeof window.showSaveFilePicker === 'function') where = 'Saves via file picker.';
             else where = 'Saves via automatic download.';
-            summaryEl.textContent =
-                `${pendingTier.resolution} · ${formatBitrate(bitrate)} · ${size} · ${where}`;
+            let text = `${pendingTier.resolution} · ${formatBitrate(bitrate)} · ${size} · ${where}`;
+            // Pointless-transcode detector: the picked settings would not change the file.
+            if (!batchOpt && !batchSeason && isPointlessTranscode(pendingTier, bitrate)) {
+                text += ' — identical to the original: grab Original above instead (no re-encode, no wait).';
+            }
+            summaryEl.textContent = text;
+        };
+
+        // True when the picked rung/codec would leave the file effectively unchanged:
+        // same codec, no downscale, no bitrate cut, and nothing to burn.
+        // (Subtitles alone don't count — the original already carries every track.)
+        function isPointlessTranscode(tier, scaledBitrate) {
+            if (!currentSource) return false;
+            const streams = currentSource.MediaStreams || [];
+            const v = streams.find(x => x.Type === 'Video');
+            if (!v) return false;
+            if (normCodec(v.Codec) !== selectedVideoCodec) return false;
+            if (v.Height && v.Height > tier.maxHeight) return false;
+            if (currentSource.Bitrate && currentSource.Bitrate > scaledBitrate) return false;
+            if (selectedSubtitleMode === 'burn' && selectedSubtitleChecked.size > 0) return false;
+            return true;
+        }
+
+        // The untouched source file: no transcode, no wait, all tracks included.
+        // Downloaded straight by the browser (or handed to it on Android).
+        const downloadOriginal = () => {
+            getApiClient(0, 5, (client) => {
+                const token = client.accessToken();
+                const baseUrl = client.serverAddress() || window.location.origin;
+                const url = `${baseUrl}/Items/${item.Id || itemId}/Download?ApiKey=${encodeURIComponent(token)}`;
+                scrim.remove();
+                if (isAndroidAppWebView()) {
+                    handOffToBrowser(url, baseUrl, null, null);
+                    return;
+                }
+                const a = document.createElement('a');
+                a.href = url;
+                const container = (currentSource && currentSource.Container) || 'mkv';
+                a.download = sanitizeFilename(
+                    `${item.Name || 'download'} (${item.ProductionYear || '????'}).${container}`,
+                    `download.${container}`);
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                showTransientNotice(`Downloading original: ${a.download}`);
+            });
         };
 
         const doDownload = () => {
             if (!pendingTier) return;
+            if (pendingTier.original) {
+                downloadOriginal();
+                return;
+            }
             const tier = pendingTier;
             const bitrate = scaleBitrate(tier.bitrate, videoCodecFactor(selectedVideoCodec));
             const videoCodec = selectedVideoCodec;
